@@ -18,6 +18,9 @@ python binary_onnx_to_RTL.py --onnx-model path/to/model.onnx --out-dir ./my_ip
 # With testbench
 python binary_onnx_to_RTL.py --onnx-model model.onnx --out-dir ./output --emit-testbench
 
+# Flattened RTL structure (single inlined module, like binaryclass_NN_core_flatten.sv)
+python binary_onnx_to_RTL.py --onnx-model model.onnx --out-dir ./output --rtl-structure flattened
+
 # Override quantization
 python binary_onnx_to_RTL.py --onnx-model model.onnx --out-dir ./output --weight-format int8
 ```

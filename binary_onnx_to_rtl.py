@@ -19,8 +19,9 @@ _CONVERT_DIR = _SCRIPT_DIR.parent / "convert_model_to_RTL"
 _ONNX_LIB = _CONVERT_DIR / "onnx_lib"
 if _ONNX_LIB.is_dir() and str(_ONNX_LIB) not in sys.path:
     sys.path.insert(0, str(_ONNX_LIB))
-if str(_CONVERT_DIR) not in sys.path:
-    sys.path.insert(0, str(_CONVERT_DIR))
+# rtl_mapper is in same directory as this script (Binary_ONNX_to_RTL)
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 
 def _load_onnx(onnx_path: Path) -> Any:
@@ -74,6 +75,43 @@ def _try_get_matmul_bias_from_add(
     return None
 
 
+def _try_get_bias_from_add_chain(
+    model: Any,
+    start_output: str,
+    out_features: int,
+    name_to_init: Dict[str, np.ndarray],
+    visited: Optional[set] = None,
+) -> Optional[np.ndarray]:
+    """Follow output through Mul/Cast to find Add with constant bias (for MatMulInteger chains)."""
+    if visited is None:
+        visited = set()
+    if start_output in visited:
+        return None
+    visited.add(start_output)
+    for node in model.graph.node:
+        if start_output not in list(node.input):
+            continue
+        if node.op_type == "Add" and len(node.input) >= 2:
+            inputs = list(node.input)
+            other = inputs[1] if inputs[0] == start_output else inputs[0]
+            if other in name_to_init:
+                arr = name_to_init[other]
+                b = arr.flatten()
+                if len(b) == out_features:
+                    if arr.dtype in (np.int8, np.uint8, np.int16, np.uint16):
+                        return (b.astype(np.float32) - 0) / 128.0  # rough dequant
+                    if arr.dtype == np.int32:
+                        return b.astype(np.float32) / 16384.0  # 128*128 combined scale
+                    return b.astype(np.float32)
+        if node.op_type in ("Mul", "Cast") and node.output:
+            found = _try_get_bias_from_add_chain(
+                model, node.output[0], out_features, name_to_init, visited
+            )
+            if found is not None:
+                return found
+    return None
+
+
 def _build_value_to_array(model: Any, inits: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     from onnx.numpy_helper import to_array
     result: Dict[str, np.ndarray] = dict(inits)
@@ -93,6 +131,14 @@ def _build_value_to_array(model: Any, inits: Dict[str, np.ndarray]) -> Dict[str,
     return result
 
 
+def _get_node_op_type(node: Any) -> str:
+    """Return op_type, including domain prefix for non-standard ops."""
+    domain = getattr(node, "domain", "") or ""
+    if domain and domain != "ai.onnx":
+        return f"{domain}::{node.op_type}"
+    return node.op_type
+
+
 def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
 
     model = _load_onnx(onnx_path)
@@ -104,10 +150,12 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
     fc_counter = 0
 
     for node in model.graph.node:
+        op_type = _get_node_op_type(node)
         is_qlinear_matmul = node.op_type == "QLinearMatMul"
         is_qlinear_gemm = node.op_type == "QLinearGemm"
+        is_fused_matmul = op_type == "com.microsoft::FusedMatMul"
 
-        if node.op_type == "Gemm" or is_qlinear_matmul or is_qlinear_gemm:
+        if node.op_type == "Gemm" or is_qlinear_matmul or is_qlinear_gemm or is_fused_matmul:
             fc_counter += 1
             name = f"fc{fc_counter}"
             inputs = list(node.input)
@@ -120,6 +168,12 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
                 b_scale_name = inputs[4]
                 b_zp_name = inputs[5]
                 bias_name = inputs[8] if len(inputs) >= 9 else None
+            elif is_fused_matmul:
+                if len(inputs) < 2:
+                    LOGGER.warning(f"FusedMatMul node {node.name} has < 2 inputs, skipping")
+                    continue
+                b_name = inputs[1]  # B = weight matrix
+                bias_name = inputs[2] if len(inputs) >= 3 else None
             else:
                 if len(inputs) < 2:
                     LOGGER.warning(f"Gemm node {node.name} has < 2 inputs, skipping")
@@ -148,7 +202,7 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
             in_features, out_features = w_np.shape
             weight = w_np.T.astype(np.float32)
 
-            if not is_qlinear_matmul and not is_qlinear_gemm:
+            if not is_qlinear_matmul and not is_qlinear_gemm and not is_fused_matmul:
                 trans_b = _get_attr(node, "transB", 0)
                 alpha = _get_attr(node, "alpha", 1.0)
                 if trans_b:
@@ -218,6 +272,45 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
                 "out_features": out_features,
             })
 
+        elif node.op_type == "MatMulInteger":
+            # Dynamic quantization: int8 activations * int8 weights -> int32
+            # Dequantize B to float for RTL flow (scale 1/128 for symmetric int8)
+            inputs = list(node.input)
+            if len(inputs) < 2:
+                continue
+            b_name = inputs[1]
+            if b_name not in name_to_init:
+                continue
+            w_np = name_to_init[b_name].copy()
+            if w_np.ndim != 2:
+                continue
+            if len(inputs) >= 4 and inputs[3] in name_to_init:
+                zp_arr = name_to_init[inputs[3]]
+                if zp_arr.size == 1:
+                    b_zp = int(zp_arr.flatten()[0])
+                    w_np = (w_np.astype(np.float32) - b_zp) / 128.0
+                elif zp_arr.size == w_np.shape[1]:  # per-column zero point
+                    w_np = (w_np.astype(np.float32) - zp_arr.astype(np.float32).reshape(1, -1)) / 128.0
+                else:
+                    w_np = w_np.astype(np.float32) / 128.0
+            else:
+                w_np = w_np.astype(np.float32) / 128.0
+            in_features, out_features = w_np.shape
+            weight = w_np.T.astype(np.float32)
+            bias_np = _try_get_bias_from_add_chain(model, node.output[0], out_features, name_to_init)
+            if bias_np is None:
+                bias_np = np.zeros((out_features,), dtype=np.float32)
+            if input_size is None:
+                input_size = in_features
+            fc_counter += 1
+            layers.append({
+                "name": f"fc{fc_counter}",
+                "weight": weight,
+                "bias": bias_np,
+                "in_features": in_features,
+                "out_features": out_features,
+            })
+
     if input_size is None and layers:
         input_size = layers[0]["in_features"]
     if input_size is None:
@@ -274,9 +367,16 @@ def main() -> int:
         help="Also emit legacy rtl/ flow outputs",
     )
     parser.add_argument(
-        "--verbose",
+        "--rtl-structure",
+        type=str,
+        choices=["hierarchical", "flattened"],
+        default="hierarchical",
+        help="RTL structure: 'hierarchical' (separate modules) or 'flattened' (single inlined module). Default: hierarchical",
+    )
+    parser.add_argument(
+        "--inspect",
         action="store_true",
-        help="Enable verbose logging",
+        help="Print ONNX graph structure (node types, inputs) and exit",
     )
 
     args = parser.parse_args()
@@ -287,8 +387,19 @@ def main() -> int:
         LOGGER.error(f"ONNX model not found: {onnx_path}")
         return 1
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    if args.inspect:
+        model = _load_onnx(onnx_path)
+        node_types: Dict[str, int] = {}
+        for node in model.graph.node:
+            op = _get_node_op_type(node)
+            node_types[op] = node_types.get(op, 0) + 1
+        print("Node types:", ", ".join(f"{op}({n})" for op, n in sorted(node_types.items())))
+        print("\nNodes:")
+        for node in model.graph.node:
+            op = _get_node_op_type(node)
+            ins = ", ".join(node.input[:4]) + ("..." if len(node.input) > 4 else "")
+            print(f"  {op}: {node.name} <- [{ins}]")
+        return 0
 
     # 1. Auto-detect quantization via detect_quant_type 
     from detect_quant_type import detect_quantization_type, quant_type_to_bits
@@ -307,10 +418,18 @@ def main() -> int:
     layers_raw, input_size = extract_layers_from_onnx(onnx_path)
 
     if not layers_raw:
+        # Diagnostic: list node types in the model
+        model = _load_onnx(onnx_path)
+        node_types: Dict[str, int] = {}
+        for node in model.graph.node:
+            op = _get_node_op_type(node)
+            node_types[op] = node_types.get(op, 0) + 1
+        summary = ", ".join(f"{op}({n})" for op, n in sorted(node_types.items()))
         LOGGER.error(
-            "No Gemm/MatMul/QLinearMatMul/QLinearGemm layers found in ONNX model. "
+            "No Gemm/MatMul/QLinearMatMul/QLinearGemm/FusedMatMul/MatMulInteger layers found in ONNX model. "
             "Binary classifier expects FC layers."
         )
+        LOGGER.info(f"Node types in model: {summary}")
         return 1
 
     LOGGER.info(f"Found {len(layers_raw)} linear layers, input_size={input_size}")
@@ -329,6 +448,8 @@ def main() -> int:
         generate_fc_layer_wrapper,
         generate_fc_out_layer,
         generate_top_module,
+        generate_flattened_top_module,
+        generate_wrapper_module,
         generate_testbench,
         generate_mapping_report,
         generate_netlist_json,
@@ -397,30 +518,46 @@ def main() -> int:
             write_sv=False,
         )
 
-    # 7. Write embedded RTL templates
-    LOGGER.info("Writing RTL templates...")
-    write_embedded_rtl_templates(sv_dir, weight_format_bits)
-
-    # 8. Generate ROM and layer modules
-    LOGGER.info("Generating ROM and layer modules...")
-    for layer in layers:
-        if layer.layer_type == "linear":
-            generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir)
-            generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir)
-            if layer.name == "fc1":
-                generate_fc_layer_wrapper(
-                    layer.name, layer.in_features or 0, layer.out_features or 0,
-                    args.data_width, weight_format_bits, sv_dir,
-                )
-            else:
-                generate_fc_out_layer(
-                    layer.name, layer.out_features or 0, layer.in_features or 0, sv_dir,
-                )
-
-    # 9. Generate top module
     model_name = onnx_path.stem
-    LOGGER.info("Generating top module...")
-    generate_top_module(model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir)
+    use_flattened = args.rtl_structure == "flattened"
+    linear_layers = [l for l in layers if l.layer_type == "linear"]
+    if use_flattened and len(linear_layers) < 3:
+        LOGGER.warning(
+            f"Flattened RTL requires at least 3 FC layers; found {len(linear_layers)}. "
+            "Falling back to hierarchical structure."
+        )
+        use_flattened = False
+
+    # 7. Write embedded RTL templates (quant_pkg always needed; submodules only for hierarchical)
+    LOGGER.info("Writing RTL templates...")
+    write_embedded_rtl_templates(sv_dir, weight_format_bits, write_submodules=not use_flattened)
+
+    if use_flattened:
+        # 8a. Flattened: single inlined top module + wrapper (no separate ROM/layer modules)
+        LOGGER.info("Generating flattened RTL structure...")
+        generate_flattened_top_module(
+            model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir
+        )
+        generate_wrapper_module(model_name, layers, weight_format_bits, sv_dir)
+    else:
+        # 8b. Hierarchical: ROM, layer, and top modules
+        LOGGER.info("Generating hierarchical RTL structure...")
+        for layer in layers:
+            if layer.layer_type == "linear":
+                generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir)
+                generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir)
+                if layer.name == "fc1":
+                    generate_fc_layer_wrapper(
+                        layer.name, layer.in_features or 0, layer.out_features or 0,
+                        args.data_width, weight_format_bits, sv_dir,
+                    )
+                else:
+                    generate_fc_out_layer(
+                        layer.name, layer.out_features or 0, layer.in_features or 0, sv_dir,
+                    )
+
+        LOGGER.info("Generating top module...")
+        generate_top_module(model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir)
 
     # 10. Testbench
     if args.emit_testbench:
