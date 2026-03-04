@@ -453,6 +453,7 @@ def main() -> int:
         generate_testbench,
         generate_mapping_report,
         generate_netlist_json,
+        generate_rtl_filelist,
         emit_legacy_rtl_outputs,
     )
 
@@ -478,16 +479,16 @@ def main() -> int:
             full_layers.append(LayerInfo(name=f"relu_{i+1}", layer_type="relu"))
     layers = full_layers
 
-    # 4. Setup output directories
+    # 4. Setup output directories (binaryclass_nn format: flat layout)
     out_dir.mkdir(parents=True, exist_ok=True)
-    sv_dir = out_dir / "src" / "rtl" / "systemverilog"
+    sv_dir = out_dir
     sv_dir.mkdir(parents=True, exist_ok=True)
-    mem_dir = sv_dir / "mem"
+    mem_dir = out_dir / "mem_files"
     mem_dir.mkdir(parents=True, exist_ok=True)
     tb_sim_dir = out_dir / "tb" / "sim"
     tb_sim_dir.mkdir(parents=True, exist_ok=True)
 
-    # 5. Generate .mem files
+    # 5. Generate .mem files (binaryclass_nn format: mem_files/fc1_weights.mem)
     LOGGER.info(f"Writing .mem files (int{weight_format_bits})...")
     for layer in layers:
         if layer.layer_type != "linear":
@@ -496,7 +497,7 @@ def main() -> int:
         b_np = layer.bias.detach().cpu().numpy().astype(np.float32) if layer.bias is not None else np.zeros((layer.out_features or 0,), dtype=np.float32)
         wq = float_to_int(w_np, args.scale, weight_format_bits)
         bq = float_to_int(b_np, args.scale, weight_format_bits)
-        weight_mem_path = mem_dir / f"{layer.name}_weights_packed.mem"
+        weight_mem_path = mem_dir / f"{layer.name}_weights.mem"
         bias_mem_path = mem_dir / f"{layer.name}_biases.mem"
         generate_quant_pkg_style_weight_mem(
             wq, weight_mem_path, layer.name,
@@ -544,8 +545,8 @@ def main() -> int:
         LOGGER.info("Generating hierarchical RTL structure...")
         for layer in layers:
             if layer.layer_type == "linear":
-                generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir)
-                generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir)
+                generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
+                generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
                 if layer.name == "fc1":
                     generate_fc_layer_wrapper(
                         layer.name, layer.in_features or 0, layer.out_features or 0,
@@ -569,6 +570,7 @@ def main() -> int:
     frac_bits = 8
     generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, frac_bits)
     generate_netlist_json(out_dir, model_name, layers)
+    generate_rtl_filelist(out_dir, model_name, layers)
 
     LOGGER.info(f"Binary classifier RTL generation complete! Output: {out_dir}")
     return 0

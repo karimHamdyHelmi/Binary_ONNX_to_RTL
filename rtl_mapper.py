@@ -2,6 +2,7 @@
 """
 Minimal rtl_mapper for binary_onnx_to_rtl.py.
 Contains only the functions needed for ONNX-to-RTL conversion (no PyTorch model loading).
+Output format matches binaryclass_nn: PyramidTech header, clk_i/rst_n_i, _s/_q suffixes, etc.
 """
 from __future__ import annotations
 
@@ -16,6 +17,47 @@ import torch
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# PyramidTech / binaryclass_nn format constants
+# -----------------------------------------------------------------------------
+PYRAMIDTECH_HEADER = r'''/****************************************************************************************
+"PYRAMIDTECH CONFIDENTIAL
+
+Copyright (c) 2026 PyramidTech LLC. All rights reserved.
+
+This file contains proprietary and confidential information of PyramidTech LLC.
+The information contained herein is unpublished and subject to trade secret
+protection. No part of this file may be reproduced, modified, distributed,
+transmitted, disclosed, or used in any form or by any means without the
+prior written permission of PyramidTech LLC.
+
+This material must be returned immediately upon request by PyramidTech LLC"
+/****************************************************************************************
+'''
+
+
+def _pyramidtech_wrap(content: str, file_name: str, description: str) -> str:
+    """Wrap RTL content with PyramidTech header and keywords."""
+    header = (
+        PYRAMIDTECH_HEADER
+        + f"File name:      {file_name}\n  \nDescription:    {description}\n  \nAuthor:         Ahmed Abou-Auf\n  \nChange History:\n02-25-2026     AA  Initial Release\n  \n****************************************************************************************/\n\n"
+    )
+    return header + '`begin_keywords "1800-2012"\n' + content.rstrip() + "\n`end_keywords\n"
+
+
+def _q_data_decl(name: str, size: int, prefix: str = "    ") -> str:
+    """Format q_data_t declaration: scalar when size==1, array otherwise."""
+    if size == 1:
+        return f"{prefix}q_data_t   {name};"
+    return f"{prefix}q_data_t   {name} [{size}];"
+
+
+def _q_data_port_decl(name: str, size: int, direction: str = "output") -> str:
+    """Format q_data_t port declaration: scalar when size==1, array otherwise."""
+    if size == 1:
+        return f"    {direction} q_data_t {name}"
+    return f"    {direction} q_data_t {name} [{size}]"
 
 
 def float_to_int(val: np.ndarray, scale: int, bit_width: int) -> np.ndarray:
@@ -73,7 +115,7 @@ def generate_quant_pkg_style_weight_mem(
                 for neuron_idx in range(num_neurons):
                     val = int(weight_matrix[neuron_idx, j]) & mask
                     packed |= val << (neuron_idx * bit_width)
-                wf.write(f"{packed:0{hex_width}x}\n")
+                wf.write(f"{packed:0{hex_width}X}\n")
         else:
             num_inputs = in_features
             total_bits = num_inputs * bit_width
@@ -83,7 +125,7 @@ def generate_quant_pkg_style_weight_mem(
                 for inp_idx in range(num_inputs):
                     val = int(weight_matrix[neuron_idx, inp_idx]) & mask
                     packed |= val << (inp_idx * bit_width)
-                wf.write(f"{packed:0{hex_width}x}\n")
+                wf.write(f"{packed:0{hex_width}X}\n")
 
 
 def generate_quant_pkg_style_bias_mem(
@@ -103,7 +145,7 @@ def generate_quant_pkg_style_bias_mem(
         val = int(bias_vector[neuron_idx]) & mask
         packed |= val << (neuron_idx * bit_width)
     with out_path.open("w", encoding="utf-8") as bf:
-        bf.write(f"{packed:0{hex_width}x}\n")
+        bf.write(f"{packed:0{hex_width}X}\n")
 
 
 def generate_quant_pkg_style_mems(
@@ -137,7 +179,7 @@ def generate_quant_pkg_style_mems(
                 for neuron_idx in range(num_neurons):
                     val = int(weight_matrix[neuron_idx, j]) & mask
                     packed |= val << (neuron_idx * bit_width)
-                wf.write(f"{packed:0{hex_width}x}\n")
+                wf.write(f"{packed:0{hex_width}X}\n")
         else:
             num_inputs = in_features
             total_bits = num_inputs * bit_width
@@ -147,7 +189,7 @@ def generate_quant_pkg_style_mems(
                 for inp_idx in range(num_inputs):
                     val = int(weight_matrix[neuron_idx, inp_idx]) & mask
                     packed |= val << (inp_idx * bit_width)
-                wf.write(f"{packed:0{hex_width}x}\n")
+                wf.write(f"{packed:0{hex_width}X}\n")
 
     biases_path = mem_dir / f"{layer_name}_biases_{bit_width}.mem"
     num_neurons = bias_vector.shape[0]
@@ -158,7 +200,7 @@ def generate_quant_pkg_style_mems(
         val = int(bias_vector[neuron_idx]) & mask
         packed_biases |= val << (neuron_idx * bit_width)
     with biases_path.open("w", encoding="utf-8") as bf:
-        bf.write(f"{packed_biases:0{hex_width}x}\n")
+        bf.write(f"{packed_biases:0{hex_width}X}\n")
 
 
 def emit_legacy_rtl_outputs(
@@ -199,67 +241,88 @@ def emit_legacy_rtl_outputs(
 # -----------------------------------------------------------------------------
 
 def _get_quant_pkg_content(weight_width: int) -> str:
-    """Generate quant_pkg.sv with Q_WIDTH based on weight_width."""
+    """Generate quant_pkg.sv in binaryclass_nn format with Q_WIDTH based on weight_width."""
     if weight_width not in (4, 8, 16):
         weight_width = 16
     define_line = f"`define Q_INT{weight_width}\n"
     default_def = "`ifndef Q_INT4\n`ifndef Q_INT8\n`ifndef Q_INT16\n`define Q_INT16\n`endif\n`endif\n`endif\n"
-    return define_line + default_def + '''package quant_pkg;
+    body = define_line + default_def + '''package quant_pkg;
 
-   `ifdef Q_INT4
-      localparam int Q_WIDTH = 4;
-   `elsif Q_INT8
-      localparam int Q_WIDTH = 8;
-   `elsif Q_INT16
-      localparam int Q_WIDTH = 16;
-   `endif
+  timeunit 1ns;
+  timeprecision 1ps;
 
-   `ifdef Q_INT4
-      localparam int FRAC_WIDTH = 2;
-   `elsif Q_INT8
-      localparam int FRAC_WIDTH = 4;
-   `elsif Q_INT16
-      localparam int FRAC_WIDTH = 8;
-   `endif
+  `ifdef Q_INT4
+    localparam int Q_WIDTH = 32'd4;
+  `elsif Q_INT8
+    localparam int Q_WIDTH = 32'd8;
+  `elsif Q_INT16
+    localparam int Q_WIDTH = 32'd16;
+  `else
+    localparam int Q_WIDTH = 32'd8;
+  `endif
 
-   `ifdef Q_INT4
-      localparam int SATURATION_H = 32'sd7;
-   `elsif Q_INT8
-      localparam int SATURATION_H = 32'sd127;
-   `elsif Q_INT16
-      localparam int SATURATION_H = 32'sd32767;
-   `endif
+  typedef logic signed [Q_WIDTH-1:0]       q_data_t;
+  typedef logic signed [2*Q_WIDTH-1:0]     q_mult_t;
+  typedef logic signed [4*Q_WIDTH-1:0]     acc_t;
 
-   `ifdef Q_INT4
-      localparam int SATURATION_L = -32'sd8;
-   `elsif Q_INT8
-      localparam int SATURATION_L = -32'sd128;
-   `elsif Q_INT16
-      localparam int SATURATION_L = -32'sd32768;
-   `endif
+  localparam int DATA_WIDTH = 32'd32;
+  localparam int KEEP_WIDTH = 32'd4;
 
-   `ifdef Q_INT4
-      localparam int LIMIT_H = 4'sd7;
-   `elsif Q_INT8
-      localparam int LIMIT_H = 8'sd127;
-   `elsif Q_INT16
-      localparam int LIMIT_H = 16'sd32767;
-   `endif
+  localparam q_data_t Q_MAX = {1'b0, {Q_WIDTH-1{1'b1}}};
+  localparam q_data_t Q_MIN = {1'b1, {Q_WIDTH-1{1'b0}}};
 
-   `ifdef Q_INT4
-      localparam int LIMIT_L = -4'sd8;
-   `elsif Q_INT8
-      localparam int LIMIT_L = -8'sd128;
-   `elsif Q_INT16
-      localparam int LIMIT_L = -16'sd32768;
-   `endif
+  localparam acc_t ACC_Q_MAX = acc_t'(Q_MAX);
+  localparam acc_t ACC_Q_MIN = acc_t'(Q_MIN);
 
-   typedef logic signed [Q_WIDTH-1:0]  q_data_t;
-   typedef logic        [Q_WIDTH-1:0]  pred_t;
-   typedef logic signed [31:0]         acc_t;
+  localparam acc_t ACC_FULL_MAX = {1'b0, {4*Q_WIDTH-1{1'b1}}};
+  localparam acc_t ACC_FULL_MIN = {1'b1, {4*Q_WIDTH-1{1'b0}}};
 
-endpackage
+  `ifdef Q_INT4
+    localparam int FRAC_WIDTH = 2;
+  `elsif Q_INT8
+    localparam int FRAC_WIDTH = 4;
+  `elsif Q_INT16
+    localparam int FRAC_WIDTH = 8;
+  `endif
+
+  `ifdef Q_INT4
+    localparam int SATURATION_H = 32'sd7;
+  `elsif Q_INT8
+    localparam int SATURATION_H = 32'sd127;
+  `elsif Q_INT16
+    localparam int SATURATION_H = 32'sd32767;
+  `endif
+
+  `ifdef Q_INT4
+    localparam int SATURATION_L = -32'sd8;
+  `elsif Q_INT8
+    localparam int SATURATION_L = -32'sd128;
+  `elsif Q_INT16
+    localparam int SATURATION_L = -32'sd32768;
+  `endif
+
+  `ifdef Q_INT4
+    localparam int LIMIT_H = 4'sd7;
+  `elsif Q_INT8
+    localparam int LIMIT_H = 8'sd127;
+  `elsif Q_INT16
+    localparam int LIMIT_H = 16'sd32767;
+  `endif
+
+  `ifdef Q_INT4
+    localparam int LIMIT_L = -4'sd8;
+  `elsif Q_INT8
+    localparam int LIMIT_L = -8'sd128;
+  `elsif Q_INT16
+    localparam int LIMIT_L = -16'sd32768;
+  `endif
+
+  localparam q_data_t SIGMOID_MAX = 1 << (Q_WIDTH - 2);
+  localparam q_data_t SIGMOID_MIN = 8'h0;
+
+endpackage: quant_pkg
 '''
+    return _pyramidtech_wrap(body, "quant_pkg.sv", "Package defining quantization widths, fixed-point data types, and saturation limits.")
 
 
 EMBEDDED_MAC_SV = '''`timescale 1ns/1ps
@@ -481,49 +544,50 @@ endmodule
 '''
 
 
-EMBEDDED_RELU_LAYER_SV = '''`timescale 1ns / 1ps
-import quant_pkg::*;
-
-module relu_layer #(
-   parameter int NUM_NEURONS = 8
+EMBEDDED_RELU_LAYER_SV = '''module relu_layer 
+  import quant_pkg::*;
+#(
+  parameter int NUM_NEURONS = 8
 )(
-    input  logic         clk,
-    input  logic         rst_n,
-    input  logic         valid_in,
-    input  q_data_t      data_in  [NUM_NEURONS],
-
-    output q_data_t      data_out [NUM_NEURONS],
-    output logic         valid_out
+  input  logic        clk_i,
+  input  logic        rst_n_i,
+  input  logic        valid_i,
+  input  q_data_t     data_i [NUM_NEURONS],
+  output q_data_t     data_o [NUM_NEURONS],
+  output logic        valid_o
 );
 
-    logic valid_pipeline;
-    integer i;
+  timeunit 1ns;
+  timeprecision 1ps;
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            valid_pipeline <= 1'b0;
+  logic valid_pipeline_q;
+  integer i;
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : relu_pipeline
+    if (!rst_n_i)
+      valid_pipeline_q <= 1'b0;
+    else
+      valid_pipeline_q <= valid_i;
+  end : relu_pipeline
+
+  assign valid_o = valid_pipeline_q;
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : relu_data
+    if (!rst_n_i) begin
+      for (i = 0; i < NUM_NEURONS; i++)
+        data_o[i] <= '0;
+    end
+    else if (valid_i) begin
+      for (i = 0; i < NUM_NEURONS; i++) begin
+        if (data_i[i] < 0)
+          data_o[i] <= '0;
         else
-            valid_pipeline <= valid_in;
+          data_o[i] <= data_i[i];
+      end
     end
+  end : relu_data
 
-    assign valid_out = valid_pipeline;
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (i = 0; i < NUM_NEURONS; i++)
-                data_out[i] <= '0;
-        end
-        else if (valid_in) begin
-            for (i = 0; i < NUM_NEURONS; i++) begin
-                if (data_in[i] < 0)
-                    data_out[i] <= '0;
-                else
-                    data_out[i] <= data_in[i];
-            end
-        end
-    end
-
-endmodule
+endmodule : relu_layer
 '''
 
 
@@ -534,10 +598,10 @@ def write_embedded_rtl_templates(sv_dir: Path, weight_width: int, *, write_submo
 
     (sv_dir / "quant_pkg.sv").write_text(_get_quant_pkg_content(weight_width), encoding="utf-8")
     if write_submodules:
-        (sv_dir / "mac.sv").write_text(EMBEDDED_MAC_SV, encoding="utf-8")
-        (sv_dir / "fc_in.sv").write_text(EMBEDDED_FC_IN_SV, encoding="utf-8")
-        (sv_dir / "fc_out.sv").write_text(EMBEDDED_FC_OUT_SV, encoding="utf-8")
-        (sv_dir / "relu_layer.sv").write_text(EMBEDDED_RELU_LAYER_SV, encoding="utf-8")
+        (sv_dir / "mac.sv").write_text(_pyramidtech_wrap(EMBEDDED_MAC_SV, "mac.sv", "Multiply-accumulate unit for FC layers."), encoding="utf-8")
+        (sv_dir / "fc_in.sv").write_text(_pyramidtech_wrap(EMBEDDED_FC_IN_SV, "fc_in.sv", "FC input compute block."), encoding="utf-8")
+        (sv_dir / "fc_out.sv").write_text(_pyramidtech_wrap(EMBEDDED_FC_OUT_SV, "fc_out.sv", "FC output compute block."), encoding="utf-8")
+        (sv_dir / "relu_layer.sv").write_text(_pyramidtech_wrap(EMBEDDED_RELU_LAYER_SV, "relu_layer.sv", "ReLU activation layer."), encoding="utf-8")
         LOGGER.info("Wrote embedded RTL templates (quant_pkg, mac, fc_in, fc_out, relu_layer)")
     else:
         LOGGER.info("Wrote quant_pkg.sv only (flattened mode)")
@@ -548,10 +612,12 @@ def generate_weight_rom(
     in_features: int,
     num_neurons: int,
     weight_width: int,
-    out_dir: Path
+    out_dir: Path,
+    *,
+    mem_subdir: str = "mem_files",
 ) -> Path:
-    """Generate weight_rom_<layer>.sv module."""
-    mem_file = f"src/rtl/systemverilog/mem/{layer_name}_weights_packed.mem"
+    """Generate weight_rom_<layer>.sv module in binaryclass_nn format."""
+    mem_file = f"{mem_subdir}/{layer_name}_weights.mem"
     if layer_name == "fc1":
         depth = in_features
         packed_width = num_neurons * weight_width
@@ -559,26 +625,33 @@ def generate_weight_rom(
         depth = num_neurons
         packed_width = in_features * weight_width
 
-    content = f"""`timescale 1ns/1ps
-
-module weight_rom_{layer_name} #(
-    parameter int ADDR_WIDTH = $clog2({depth}),
-    parameter int DATA_WIDTH = {packed_width}
-)(
-    input  logic [ADDR_WIDTH-1:0] addr,
-    output logic [DATA_WIDTH-1:0] data
+    body = f"""module weight_rom_{layer_name} #(
+  parameter int DEPTH  = {depth},
+  parameter int WIDTH  = {packed_width},
+  parameter int ADDR_W = (DEPTH > 1) ? $clog2(DEPTH) : 1
+) (
+  input  logic              clk_i,
+  input  logic [ADDR_W-1:0] addr_i,
+  output logic [WIDTH-1:0]  data_o
 );
 
-    logic [DATA_WIDTH-1:0] mem [0:{depth}-1];
+  timeunit 1ns;
+  timeprecision 1ps;
 
-    initial begin
-        $readmemh("{mem_file}", mem);
-    end
+  (* rom_style = "block" *)
+  logic [WIDTH-1:0] mem [0:DEPTH-1];
 
-    assign data = mem[addr];
+  initial begin
+    $readmemh("{mem_file}", mem);
+  end
 
-endmodule
+  always_ff @(posedge clk_i) begin : read_port
+    data_o <= mem[addr_i];
+  end : read_port
+
+endmodule : weight_rom_{layer_name}
 """
+    content = _pyramidtech_wrap(body, f"weight_rom_{layer_name}.sv", f"ROM of weights for {layer_name} layer")
     out_path = out_dir / f"weight_rom_{layer_name}.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
@@ -589,30 +662,38 @@ def generate_bias_rom(
     layer_name: str,
     num_neurons: int,
     weight_width: int,
-    out_dir: Path
+    out_dir: Path,
+    *,
+    mem_subdir: str = "mem_files",
 ) -> Path:
-    """Generate bias_rom_<layer>.sv module."""
-    mem_file = f"src/rtl/systemverilog/mem/{layer_name}_biases.mem"
+    """Generate bias_rom_<layer>.sv module in binaryclass_nn format."""
+    mem_file = f"{mem_subdir}/{layer_name}_biases.mem"
     packed_width = num_neurons * weight_width
 
-    content = f"""`timescale 1ns/1ps
-
-module bias_rom_{layer_name} #(
-    parameter int DATA_WIDTH = {packed_width}
-)(
-    output logic [DATA_WIDTH-1:0] data
+    body = f"""module bias_rom_{layer_name} #(
+  parameter int WIDTH = {packed_width}
+) (
+  input  logic        clk_i,
+  output logic [WIDTH-1:0] data_o
 );
 
-    logic [DATA_WIDTH-1:0] mem [0:0];
+  timeunit 1ns;
+  timeprecision 1ps;
 
-    initial begin
-        $readmemh("{mem_file}", mem);
-    end
+  (* rom_style = "block" *)
+  logic [WIDTH-1:0] mem [0:0];
 
-    assign data = mem[0];
+  initial begin
+    $readmemh("{mem_file}", mem);
+  end
 
-endmodule
+  always_ff @(posedge clk_i) begin : read_port
+    data_o <= mem[0];
+  end : read_port
+
+endmodule : bias_rom_{layer_name}
 """
+    content = _pyramidtech_wrap(body, f"bias_rom_{layer_name}.sv", f"ROM of biases for {layer_name} layer")
     out_path = out_dir / f"bias_rom_{layer_name}.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
@@ -627,79 +708,98 @@ def generate_fc_layer_wrapper(
     weight_width: int,
     out_dir: Path
 ) -> Path:
-    """Generate fc_layer_<layer>.sv wrapper module."""
-    content = f"""`timescale 1ns/1ps
-import quant_pkg::*;
-
-module fc_layer_{layer_name} #(
-    parameter int NUM_NEURONS   = {num_neurons},
-    parameter int INPUT_SIZE    = {in_features}
+    """Generate fc_layer_<layer>.sv wrapper module in binaryclass_nn format."""
+    body = f"""module fc_layer_{layer_name} 
+  import quant_pkg::*;
+#(
+  parameter int NUM_NEURONS = {num_neurons},
+  parameter int INPUT_SIZE  = {in_features}
 )(
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        valid_in,
-    input  q_data_t     input_data,
-    output q_data_t     fc_out [NUM_NEURONS],
-    output logic        valid_out
+  input  logic        clk_i,
+  input  logic        rst_n_i,
+  input  logic        valid_i,
+  input  q_data_t     data_i,
+  output q_data_t     data_o [NUM_NEURONS],
+  output logic        valid_o
 );
 
-    logic [$clog2(INPUT_SIZE)-1:0] weight_addr;
-    logic [NUM_NEURONS*Q_WIDTH-1:0] weight_row;
-    logic [NUM_NEURONS*Q_WIDTH-1:0] bias_row;
+  timeunit 1ns;
+  timeprecision 1ps;
 
-    q_data_t weights [NUM_NEURONS];
-    q_data_t bias    [NUM_NEURONS];
+  logic [$clog2(INPUT_SIZE)-1:0] weight_addr_q;
+  logic [NUM_NEURONS*Q_WIDTH-1:0] weight_row_s;
+  logic [NUM_NEURONS*Q_WIDTH-1:0] bias_row_s;
 
-    genvar i;
+  q_data_t weights_s [NUM_NEURONS];
+  q_data_t bias_s    [NUM_NEURONS];
 
-    weight_rom_{layer_name} u_weight_rom (
-        .addr(weight_addr),
-        .data(weight_row)
-    );
+  logic    valid_i_q;
+  q_data_t data_i_q;
 
-    bias_rom_{layer_name} u_bias_rom (
-        .data(bias_row)
-    );
+  genvar i;
 
-    generate
-        for (i = 0; i < NUM_NEURONS; i++) begin : WEIGHT_SLICE
-            assign weights[i] = weight_row[i*Q_WIDTH +: Q_WIDTH];
-        end
-    endgenerate
+  weight_rom_{layer_name} u_weight_rom (
+    .clk_i  (clk_i),
+    .addr_i (weight_addr_q),
+    .data_o (weight_row_s)
+  );
 
-    generate
-        for (i = 0; i < NUM_NEURONS; i++) begin : BIAS_SLICE
-            assign bias[i] = bias_row[i*Q_WIDTH +: Q_WIDTH];
-        end
-    endgenerate
+  bias_rom_{layer_name} u_bias_rom (
+    .clk_i  (clk_i),
+    .data_o (bias_row_s)
+  );
 
-    always_ff @(posedge clk) begin
-        if (!rst_n)
-            weight_addr <= '0;
-        else if (valid_in) begin
-            if (weight_addr == INPUT_SIZE-1)
-                weight_addr <= '0;
-            else
-                weight_addr <= weight_addr + 1'b1;
-        end
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : WEIGHT_SLICE
+      assign weights_s[i] = weight_row_s[i*Q_WIDTH +: Q_WIDTH];
     end
+  endgenerate
 
-    fc_in #(
-        .NUM_NEURONS (NUM_NEURONS),
-        .INPUT_SIZE  (INPUT_SIZE)
-    ) u_fc_in (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .in_valid  (valid_in),
-        .data_in   (input_data),
-        .weights   (weights),
-        .bias      (bias),
-        .fc_out    (fc_out),
-        .out_valid (valid_out)
-    );
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : BIAS_SLICE
+      assign bias_s[i] = bias_row_s[i*Q_WIDTH +: Q_WIDTH];
+    end
+  endgenerate
 
-endmodule
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : input_regs
+    if (!rst_n_i) begin
+      valid_i_q <= 1'b0;
+      data_i_q  <= '0;
+    end
+    else begin
+      valid_i_q <= valid_i;
+      data_i_q  <= data_i;
+    end
+  end : input_regs
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : addr_counter
+    if (!rst_n_i)
+      weight_addr_q <= '0;
+    else if (valid_i) begin
+      if (weight_addr_q == INPUT_SIZE-1)
+        weight_addr_q <= '0;
+      else
+        weight_addr_q <= weight_addr_q + 1'b1;
+    end
+  end : addr_counter
+
+  fc_in #(
+    .NUM_NEURONS (NUM_NEURONS),
+    .INPUT_SIZE  (INPUT_SIZE)
+  ) u_fc_in (
+    .clk       (clk_i),
+    .rst_n     (rst_n_i),
+    .in_valid  (valid_i_q),
+    .data_in   (data_i_q),
+    .weights   (weights_s),
+    .bias      (bias_s),
+    .fc_out    (data_o),
+    .out_valid (valid_o)
+  );
+
+endmodule : fc_layer_{layer_name}
 """
+    content = _pyramidtech_wrap(body, f"fc_layer_{layer_name}.sv", f"Fully-connected input layer {layer_name} with sequential ROM access.")
     out_path = out_dir / f"fc_layer_{layer_name}.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
@@ -712,132 +812,159 @@ def generate_fc_out_layer(
     num_inputs: int,
     out_dir: Path
 ) -> Path:
-    """Generate fc_out_layer_<layer>.sv for fc2/fc3."""
-    content = f"""`timescale 1ns/1ps
-import quant_pkg::*;
-
-module fc_out_layer_{layer_name} #(
-    parameter int NUM_NEURONS = {num_neurons},
-    parameter int NUM_INPUTS  = {num_inputs}
+    """Generate fc_out_layer_<layer>.sv in binaryclass_nn format."""
+    data_o_port = "output q_data_t     data_o" if num_neurons == 1 else "output q_data_t     data_o [NUM_NEURONS]"
+    body = f"""module fc_out_layer_{layer_name} 
+  import quant_pkg::*;
+#(
+  parameter int NUM_NEURONS = {num_neurons},
+  parameter int NUM_INPUTS  = {num_inputs}
 )(
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-
-    input  q_data_t fc_in [NUM_INPUTS],
-
-    output q_data_t fc_out [NUM_NEURONS],
-    output logic    valid_out
+  input  logic        clk_i,
+  input  logic        rst_n_i,
+  input  logic        valid_i,
+  input  q_data_t     data_i [NUM_INPUTS],
+  {data_o_port},
+  output logic        valid_o
 );
 
-    logic [$clog2(NUM_NEURONS)-1:0] addr_cnt;
-    logic valid_in_reg;
-    q_data_t fc_in_reg [NUM_INPUTS];
+  timeunit 1ns;
+  timeprecision 1ps;
 
-    logic [NUM_INPUTS*Q_WIDTH-1:0] weights_rom_data_raw;
-    q_data_t weights_rom_data [NUM_INPUTS];
-    q_data_t bias_rom_data [NUM_NEURONS];
-    logic [NUM_NEURONS*Q_WIDTH-1:0] bias_rom_data_raw;
-    q_data_t bias_rom_data_reg;
+  logic [$clog2(NUM_NEURONS)-1:0] addr_cnt_q;
+  logic valid_in_reg_q;
+  q_data_t data_i_reg_q [NUM_INPUTS];
 
-    logic fc_out_valid;
-    q_data_t fc_out_tmp;
-    logic [$clog2(NUM_NEURONS+1)-1:0] fc_out_cnt;
+  logic [NUM_INPUTS*Q_WIDTH-1:0] weights_rom_data_raw_s;
+  q_data_t weights_rom_data_s [NUM_INPUTS];
+  q_data_t bias_rom_data_s [NUM_NEURONS];
+  logic [NUM_NEURONS*Q_WIDTH-1:0] bias_rom_data_raw_s;
+  q_data_t bias_rom_data_reg_q;
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            addr_cnt <= '0;
-        else if (addr_cnt == NUM_NEURONS-1)
-            addr_cnt <= '0;
-        else if (valid_in || addr_cnt > 0)
-            addr_cnt <= addr_cnt + 1'b1;
+  logic fc_out_valid_s;
+  q_data_t fc_out_tmp_s;
+  logic [$clog2(NUM_NEURONS+1)-1:0] fc_out_cnt_q;
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : addr_counter
+    if (!rst_n_i)
+      addr_cnt_q <= '0;
+    else if (addr_cnt_q == NUM_NEURONS-1)
+      addr_cnt_q <= '0;
+    else if (valid_i || addr_cnt_q > 0)
+      addr_cnt_q <= addr_cnt_q + 1'b1;
+  end : addr_counter
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : input_regs
+    if (!rst_n_i) begin
+      valid_in_reg_q <= 1'b0;
+      for (int j = 0; j < NUM_INPUTS; j++)
+        data_i_reg_q[j] <= '0;
     end
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            valid_in_reg <= 1'b0;
-            for (int j = 0; j < NUM_INPUTS; j++)
-                fc_in_reg[j] <= '0;
-        end
-        else begin
-            if (addr_cnt == '0) begin
-                valid_in_reg <= valid_in;
-                fc_in_reg    <= fc_in;
-            end
-            else if (addr_cnt == NUM_NEURONS) begin
-                valid_in_reg <= 1'b0;
-                for (int j = 0; j < NUM_INPUTS; j++)
-                    fc_in_reg[j] <= '0;
-            end
-        end
+    else begin
+      if (addr_cnt_q == '0) begin
+        valid_in_reg_q <= valid_i;
+        data_i_reg_q   <= data_i;
+      end
+      else if (addr_cnt_q == NUM_NEURONS) begin
+        valid_in_reg_q <= 1'b0;
+        for (int j = 0; j < NUM_INPUTS; j++)
+          data_i_reg_q[j] <= '0;
+      end
     end
+  end : input_regs
 
-    weight_rom_{layer_name} u_weights_rom (
-        .addr(addr_cnt),
-        .data(weights_rom_data_raw)
-    );
+  logic valid_pipeline_q2;
+  logic [$clog2(NUM_NEURONS)-1:0] addr_cnt_q_d;
 
-    bias_rom_{layer_name} u_bias_rom (
-        .data(bias_rom_data_raw)
-    );
+  weight_rom_{layer_name} u_weights_rom (
+    .clk_i  (clk_i),
+    .addr_i (addr_cnt_q),
+    .data_o (weights_rom_data_raw_s)
+  );
 
-    genvar i;
-    generate
-        for (i = 0; i < NUM_INPUTS; i++) begin : INPUT_SPLIT
-            assign weights_rom_data[i] = weights_rom_data_raw[i*Q_WIDTH +: Q_WIDTH];
-        end
-    endgenerate
+  bias_rom_{layer_name} u_bias_rom (
+    .clk_i  (clk_i),
+    .data_o (bias_rom_data_raw_s)
+  );
 
-    genvar k;
-    generate
-        for (k = 0; k < NUM_NEURONS; k++) begin : SPLIT_BIAS
-            assign bias_rom_data[k] = bias_rom_data_raw[k*Q_WIDTH +: Q_WIDTH];
-        end
-    endgenerate
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            bias_rom_data_reg <= '0;
-        else
-            bias_rom_data_reg <= bias_rom_data[addr_cnt];
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : rom_align_reg
+    if (!rst_n_i) begin
+      valid_pipeline_q2 <= 1'b0;
+      addr_cnt_q_d      <= '0;
     end
-
-    fc_out #(.NUM_MULT(NUM_INPUTS)) u_fc_out (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .en          (valid_in_reg),
-        .fc_in       (fc_in_reg),
-        .weights     (weights_rom_data),
-        .bias        (bias_rom_data_reg),
-        .fc_out_valid(fc_out_valid),
-        .fc_out      (fc_out_tmp)
-    );
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (int n = 0; n < NUM_NEURONS; n++)
-                fc_out[n] <= '0;
-            fc_out_cnt <= '0;
-            valid_out  <= 1'b0;
-        end
-        else begin
-            valid_out <= 1'b0;
-            if (fc_out_valid) begin
-                for (int n = 0; n < NUM_NEURONS-1; n++)
-                    fc_out[n] <= fc_out[n+1];
-                fc_out[NUM_NEURONS-1] <= fc_out_tmp;
-                if (fc_out_cnt == NUM_NEURONS-1) begin
-                    valid_out <= 1'b1;
-                    fc_out_cnt <= '0;
-                end
-                else if (fc_out_cnt < NUM_NEURONS)
-                    fc_out_cnt <= fc_out_cnt + 1'b1;
-            end
-        end
+    else begin
+      valid_pipeline_q2 <= valid_in_reg_q;
+      addr_cnt_q_d      <= addr_cnt_q;
     end
+  end : rom_align_reg
 
-endmodule
+  genvar i;
+  generate
+    for (i = 0; i < NUM_INPUTS; i++) begin : INPUT_SPLIT
+      assign weights_rom_data_s[i] = weights_rom_data_raw_s[i*Q_WIDTH +: Q_WIDTH];
+    end
+  endgenerate
+
+  genvar k;
+  generate
+    for (k = 0; k < NUM_NEURONS; k++) begin : SPLIT_BIAS
+      assign bias_rom_data_s[k] = bias_rom_data_raw_s[k*Q_WIDTH +: Q_WIDTH];
+    end
+  endgenerate
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : bias_reg
+    if (!rst_n_i)
+      bias_rom_data_reg_q <= '0;
+    else
+      bias_rom_data_reg_q <= bias_rom_data_s[addr_cnt_q_d];
+  end : bias_reg
+
+  fc_out #(.NUM_MULT(NUM_INPUTS)) u_fc_out (
+    .clk         (clk_i),
+    .rst_n       (rst_n_i),
+    .en          (valid_pipeline_q2),
+    .fc_in       (data_i_reg_q),
+    .weights     (weights_rom_data_s),
+    .bias        (bias_rom_data_reg_q),
+    .fc_out_valid(fc_out_valid_s),
+    .fc_out      (fc_out_tmp_s)
+  );
+
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : output_shift
+    if (!rst_n_i) begin
+      for (int n = 0; n < NUM_NEURONS; n++)
+        fc_out_q[n] <= '0;
+      fc_out_cnt_q <= '0;
+      valid_o      <= 1'b0;
+    end
+    else begin
+      valid_o <= 1'b0;
+      if (fc_out_valid_s) begin
+        for (int n = 0; n < NUM_NEURONS-1; n++)
+          fc_out_q[n] <= fc_out_q[n+1];
+        fc_out_q[NUM_NEURONS-1] <= fc_out_tmp_s;
+        if (fc_out_cnt_q == NUM_NEURONS-1) begin
+          valid_o <= 1'b1;
+          fc_out_cnt_q <= '0;
+        end
+        else if (fc_out_cnt_q < NUM_NEURONS)
+          fc_out_cnt_q <= fc_out_cnt_q + 1'b1;
+      end
+    end
+  end : output_shift
+
+  assign data_o = (NUM_NEURONS == 1) ? fc_out_q[0] : fc_out_q;
+
+endmodule : fc_out_layer_{layer_name}
 """
+    # Fix assign for scalar vs array output
+    if num_neurons == 1:
+        body = body.replace("  assign data_o = (NUM_NEURONS == 1) ? fc_out_q[0] : fc_out_q;", "  assign data_o = fc_out_q[0];")
+    else:
+        body = body.replace("  assign data_o = (NUM_NEURONS == 1) ? fc_out_q[0] : fc_out_q;", "  assign data_o = fc_out_q;")
+    # Add fc_out_q declaration (always array for the shift logic)
+    body = body.replace("  logic [$clog2(NUM_NEURONS+1)-1:0] fc_out_cnt_q;", "  logic [$clog2(NUM_NEURONS+1)-1:0] fc_out_cnt_q;\n  q_data_t fc_out_q [NUM_NEURONS];")
+    content = _pyramidtech_wrap(body, f"fc_out_layer_{layer_name}.sv", f"Fully-connected output layer {layer_name} with sequential ROM access.")
     out_path = out_dir / f"fc_out_layer_{layer_name}.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
@@ -858,18 +985,18 @@ def generate_top_module(
     active_layers = [l for l in layers if l.layer_type != "flatten"]
 
     port_decls = [
-        "    input  logic        clk,",
-        "    input  logic        rst_n,",
-        "    input  logic        in_valid,",
-        "    input  q_data_t     in_data,",
+        "  input  logic        clk_i,",
+        "  input  logic        rst_n_i,",
+        "  input  logic        valid_i,",
+        "  input  q_data_t     data_i,",
     ]
 
     signal_decls = []
     instantiations = []
     connections = []
 
-    stream_valid = "in_valid"
-    stream_data = "in_data"
+    stream_valid = "valid_i"
+    stream_data = "data_i"
     stream_vector = None
     stream_vector_valid = None
     prev_fc_out = None
@@ -881,55 +1008,45 @@ def generate_top_module(
             num_neurons = layer.out_features
             in_features = layer.in_features
 
-            fc_valid_out = f"{fc_name}_valid_out"
-            fc_out = f"{fc_name}_out"
+            fc_valid_out = f"{fc_name}_valid_s"
+            fc_out = f"{fc_name}_out_s"
 
             signal_decls.extend([
-                f"    logic      {fc_valid_out};",
-                f"    q_data_t   {fc_out} [{num_neurons}];",
+                f"  logic      {fc_valid_out};",
+                _q_data_decl(fc_out, num_neurons, "  "),
                 ""
             ])
 
             if fc_name == "fc1":
-                fc_valid_in = f"{fc_name}_valid_in"
-                fc_data_in = f"{fc_name}_data_in"
-                signal_decls.extend([
-                    f"    logic      {fc_valid_in};",
-                    f"    q_data_t   {fc_data_in};",
-                    ""
-                ])
-                connections.append(f"    assign {fc_valid_in} = {stream_valid};")
-                connections.append(f"    assign {fc_data_in} = {stream_data};")
-                connections.append("")
                 instantiations.extend([
-                    f"    fc_layer_{fc_name} #(",
-                    f"        .NUM_NEURONS  ({num_neurons}),",
-                    f"        .INPUT_SIZE   ({in_features})",
-                    f"    ) u_{fc_name} (",
-                    f"        .clk       (clk),",
-                    f"        .rst_n     (rst_n),",
-                    f"        .valid_in  ({fc_valid_in}),",
-                    f"        .input_data({fc_data_in}),",
-                    f"        .fc_out    ({fc_out}),",
-                    f"        .valid_out ({fc_valid_out})",
-                    f"    );",
+                    f"  fc_layer_{fc_name} #(",
+                    f"    .NUM_NEURONS  ({num_neurons}),",
+                    f"    .INPUT_SIZE   ({in_features})",
+                    f"  ) u_{fc_name} (",
+                    f"    .clk_i    (clk_i),",
+                    f"    .rst_n_i  (rst_n_i),",
+                    f"    .valid_i  ({stream_valid}),",
+                    f"    .data_i   ({stream_data}),",
+                    f"    .data_o   ({fc_out}),",
+                    f"    .valid_o  ({fc_valid_out})",
+                    f"  );",
                     ""
                 ])
             else:
-                connections.append(f"    // fc_out_layer_{fc_name} uses {stream_vector} and {stream_vector_valid}")
+                connections.append(f"  // fc_out_layer_{fc_name} uses {stream_vector} and {stream_vector_valid}")
                 connections.append("")
                 instantiations.extend([
-                    f"    fc_out_layer_{fc_name} #(",
-                    f"        .NUM_NEURONS ({num_neurons}),",
-                    f"        .NUM_INPUTS  ({in_features})",
-                    f"    ) u_{fc_name} (",
-                    f"        .clk      (clk),",
-                    f"        .rst_n    (rst_n),",
-                    f"        .valid_in ({stream_vector_valid}),",
-                    f"        .fc_in    ({stream_vector}),",
-                    f"        .fc_out   ({fc_out}),",
-                    f"        .valid_out({fc_valid_out})",
-                    f"    );",
+                    f"  fc_out_layer_{fc_name} #(",
+                    f"    .NUM_NEURONS ({num_neurons}),",
+                    f"    .NUM_INPUTS  ({in_features})",
+                    f"  ) u_{fc_name} (",
+                    f"    .clk_i   (clk_i),",
+                    f"    .rst_n_i (rst_n_i),",
+                    f"    .valid_i ({stream_vector_valid}),",
+                    f"    .data_i  ({stream_vector}),",
+                    f"    .data_o  ({fc_out}),",
+                    f"    .valid_o ({fc_valid_out})",
+                    f"  );",
                     ""
                 ])
 
@@ -961,26 +1078,26 @@ def generate_top_module(
             relu_name = layer.name
             relu_in_vector = prev_fc_out
             relu_in_valid = prev_fc_valid
-            relu_out_vector = f"{relu_name}_out"
-            relu_out_valid = f"{relu_name}_out_valid"
+            relu_out_vector = f"{relu_name}_out_s"
+            relu_out_valid = f"{relu_name}_valid_s"
 
             signal_decls.extend([
-                f"    q_data_t   {relu_out_vector} [{num_neurons}];",
-                f"    logic      {relu_out_valid};",
+                _q_data_decl(relu_out_vector, num_neurons, "  "),
+                f"  logic      {relu_out_valid};",
                 ""
             ])
 
             instantiations.extend([
-                f"    relu_layer #(",
-                f"        .NUM_NEURONS({num_neurons})",
-                f"    ) u_{relu_name} (",
-                f"        .clk       (clk),",
-                f"        .rst_n     (rst_n),",
-                f"        .valid_in  ({relu_in_valid}),",
-                f"        .data_in   ({relu_in_vector}),",
-                f"        .data_out  ({relu_out_vector}),",
-                f"        .valid_out ({relu_out_valid})",
-                f"    );",
+                f"  relu_layer #(",
+                f"    .NUM_NEURONS({num_neurons})",
+                f"  ) u_{relu_name} (",
+                f"    .clk_i   (clk_i),",
+                f"    .rst_n_i (rst_n_i),",
+                f"    .valid_i ({relu_in_valid}),",
+                f"    .data_i  ({relu_in_vector}),",
+                f"    .data_o  ({relu_out_vector}),",
+                f"    .valid_o ({relu_out_valid})",
+                f"  );",
                 ""
             ])
 
@@ -1000,21 +1117,24 @@ def generate_top_module(
     last_fc_out = f"{last_fc.name}_out"
     last_fc_valid = f"{last_fc.name}_valid_out"
 
+    data_o_line = _q_data_port_decl("data_o", output_size, "output").replace("    ", "  ")
     port_decls.extend([
-        "    output logic    out_valid,",
-        f"    output q_data_t out_data [{output_size}]"
+        "  output logic    valid_o,",
+        data_o_line
     ])
     connections.extend([
-        f"    assign out_valid = {last_fc_valid};",
-        f"    assign out_data = {last_fc_out};"
+        f"  assign valid_o  = {last_fc_valid};",
+        f"  assign data_o   = {last_fc_out};"
     ])
 
-    content = f"""`timescale 1ns/1ps
-import quant_pkg::*;
-
-module {model_name}_top (
+    body = f"""module {model_name}_top 
+  import quant_pkg::*;
+(
 {chr(10).join(port_decls)}
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
 {chr(10).join(signal_decls)}
 
@@ -1022,8 +1142,9 @@ module {model_name}_top (
 
 {chr(10).join(instantiations)}
 
-endmodule
+endmodule : {model_name}_top
 """
+    content = _pyramidtech_wrap(body, f"{model_name}_top.sv", f"Top-level binary classification neural network for {model_name}.")
 
     out_path = out_dir / f"{model_name}_top.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1054,7 +1175,7 @@ def generate_flattened_top_module(
     n_list = [fc.out_features or 0 for fc in linear_layers]
     in_list = [linear_layers[0].in_features or input_size] + [linear_layers[i].out_features or 0 for i in range(num_layers - 1)]
 
-    mem_prefix = "src/rtl/systemverilog/mem"
+    mem_prefix = "mem_files"
     output_size = n_list[-1]
 
     parts: List[str] = []
@@ -1064,6 +1185,7 @@ def generate_flattened_top_module(
     for i in range(num_layers):
         localparam_lines.append(f"    localparam FC{i+1}_INPUT_SIZE = {in_list[i]}")
 
+    out_data_port = _q_data_port_decl("out_data", output_size, "output")
     parts.append(f'''`timescale 1ns/1ps
 import quant_pkg::*;
 
@@ -1073,7 +1195,7 @@ module {{model_name}}_top (
     input  logic        in_valid,
     input  q_data_t     in_data,
     output logic        out_valid,
-    output q_data_t     out_data [{output_size}]
+    {out_data_port}
 );
 
 {chr(10).join(localparam_lines)}
@@ -1101,7 +1223,7 @@ module {{model_name}}_top (
     (* rom_style = "block" *) logic [FC1_NEURONS*Q_WIDTH-1:0] fc1_mem_bias [0:0];
 
     initial begin
-        $readmemh("{mem_prefix}/fc1_weights_packed.mem", fc1_mem_weight);
+        $readmemh("{mem_prefix}/fc1_weights.mem", fc1_mem_weight);
         $readmemh("{mem_prefix}/fc1_biases.mem", fc1_mem_bias);
     end
 
@@ -1224,7 +1346,7 @@ module {{model_name}}_top (
     (* rom_style = "block" *) logic [FC{i}_NEURONS*Q_WIDTH-1:0] fc{i}_mem_bias [0:0];
 
     initial begin
-        $readmemh("{mem_prefix}/fc{i}_weights_packed.mem", fc{i}_mem_weight);
+        $readmemh("{mem_prefix}/fc{i}_weights.mem", fc{i}_mem_weight);
         $readmemh("{mem_prefix}/fc{i}_biases.mem", fc{i}_mem_bias);
     end
 
@@ -1338,6 +1460,7 @@ def generate_wrapper_module(
         raise RuntimeError("No linear layer for wrapper")
     output_size = last_fc.out_features or 0
 
+    out_data_port = _q_data_port_decl("out_data", output_size, "output")
     content = f'''`timescale 1ns/1ps
 import quant_pkg::*;
 
@@ -1347,7 +1470,7 @@ module {{model_name}}_wrapper (
     input  logic        in_valid,
     input  q_data_t     in_data,
     output logic        out_valid,
-    output q_data_t     out_data [{output_size}]
+    {out_data_port}
 );
 
     {{model_name}}_top u_top (
@@ -1376,6 +1499,9 @@ def generate_testbench(
     out_dir: Path
 ) -> Path:
     """Generate simple testbench."""
+    out_data_decl = _q_data_decl("out_data", output_size).replace(
+        f" [{output_size}]", " [OUTPUT_SIZE]"
+    ) if output_size > 1 else _q_data_decl("out_data", output_size)
     content = f"""`timescale 1ns/1ps
 `define Q_INT{weight_width}
 import quant_pkg::*;
@@ -1390,7 +1516,7 @@ module tb_{model_name}_top;
     logic in_valid;
     q_data_t in_data;
     logic out_valid;
-    q_data_t out_data [OUTPUT_SIZE];
+    {out_data_decl}
 
     initial begin
         clk = 0;
@@ -1404,12 +1530,12 @@ module tb_{model_name}_top;
     end
 
     {model_name}_top u_dut (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .in_valid (in_valid),
-        .in_data  (in_data),
-        .out_valid(out_valid),
-        .out_data (out_data)
+        .clk_i   (clk),
+        .rst_n_i (rst_n),
+        .valid_i (in_valid),
+        .data_i  (in_data),
+        .valid_o (out_valid),
+        .data_o  (out_data)
     );
 
     initial begin
@@ -1431,9 +1557,12 @@ module tb_{model_name}_top;
         wait(out_valid);
         @(posedge clk);
 
-        for (int i = 0; i < OUTPUT_SIZE; i++) begin
+""" + (
+        '        $display("  out_data = %0d", out_data);' if output_size == 1 else
+        '''        for (int i = 0; i < OUTPUT_SIZE; i++) begin
             $display("  out_data[%0d] = %0d", i, out_data[i]);
-        end
+        end'''
+    ) + """
 
         #100;
         $finish;
@@ -1481,8 +1610,8 @@ def generate_mapping_report(
         if layer.layer_type == "linear":
             line += f" in_features={layer.in_features:4d} out_features={layer.out_features:4d}"
             lines.append(line)
-            lines.append(f"     Weights: SIM/{layer.name}_weights_packed.mem")
-            lines.append(f"     Biases:  SIM/{layer.name}_biases.mem")
+            lines.append(f"     Weights: mem_files/{layer.name}_weights.mem")
+            lines.append(f"     Biases:  mem_files/{layer.name}_biases.mem")
         elif layer.layer_type == "relu":
             line += " (element-wise)"
             lines.append(line)
@@ -1497,8 +1626,8 @@ def generate_mapping_report(
     lines.append("-" * 80)
     for layer in layers:
         if layer.layer_type == "linear":
-            lines.append(f"  - src/rtl/systemverilog/mem/{layer.name}_weights_packed.mem")
-            lines.append(f"  - src/rtl/systemverilog/mem/{layer.name}_biases.mem")
+            lines.append(f"  - mem_files/{layer.name}_weights.mem")
+            lines.append(f"  - mem_files/{layer.name}_biases.mem")
     lines.append("")
     out_path = out_dir / "mapping_report.txt"
     out_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1524,10 +1653,39 @@ def generate_netlist_json(
         if layer.layer_type == "linear":
             layer_dict["in_features"] = layer.in_features
             layer_dict["out_features"] = layer.out_features
-            layer_dict["weight_mem"] = f"src/rtl/systemverilog/mem/{layer.name}_weights_packed.mem"
-            layer_dict["bias_mem"] = f"src/rtl/systemverilog/mem/{layer.name}_biases.mem"
+            layer_dict["weight_mem"] = f"mem_files/{layer.name}_weights.mem"
+            layer_dict["bias_mem"] = f"mem_files/{layer.name}_biases.mem"
         netlist["layers"].append(layer_dict)
 
     out_path = out_dir / "netlist.json"
     out_path.write_text(json.dumps(netlist, indent=2), encoding="utf-8")
+    return out_path
+
+
+def generate_rtl_filelist(
+    out_dir: Path,
+    model_name: str,
+    layers: List[LayerInfo],
+) -> Path:
+    """Generate rtl_filelist.f in binaryclass_nn format."""
+    linear_layers = [l for l in layers if l.layer_type == "linear"]
+    root_var = "$ROOT_DIR"
+    incdir = f"+incdir+{root_var}/\n"
+    lines = [incdir]
+    # List all RTL files (commented)
+    files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "relu_layer.sv"]
+    for layer in linear_layers:
+        files.append(f"weight_rom_{layer.name}.sv")
+        files.append(f"bias_rom_{layer.name}.sv")
+    for layer in linear_layers:
+        if layer.name == "fc1":
+            files.append(f"fc_layer_{layer.name}.sv")
+        else:
+            files.append(f"fc_out_layer_{layer.name}.sv")
+    files.append(f"{model_name}_top.sv")
+    for f in files:
+        lines.append(f"// {root_var}/{f}\n")
+    lines.append(f"{root_var}/{model_name}_top.sv\n")
+    out_path = out_dir / "rtl_filelist.f"
+    out_path.write_text("".join(lines), encoding="utf-8")
     return out_path
