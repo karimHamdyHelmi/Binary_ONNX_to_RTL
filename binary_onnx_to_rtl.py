@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
+"""
+Binary ONNX to RTL Converter
+============================
+Converts binary classification ONNX models (Gemm/MatMul FC layers) to RTL
+and .mem files for hardware synthesis. Supports Gemm, MatMul, QLinearMatMul,
+QLinearGemm, FusedMatMul, and MatMulInteger op types.
+"""
 from __future__ import annotations
 
+# -----------------------------------------------------------------------------
+# Imports and Setup
+# -----------------------------------------------------------------------------
 import argparse
 import logging
 import sys
@@ -23,6 +33,10 @@ if _ONNX_LIB.is_dir() and str(_ONNX_LIB) not in sys.path:
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+
+# -----------------------------------------------------------------------------
+# ONNX Loading and Graph Utilities
+# -----------------------------------------------------------------------------
 
 def _load_onnx(onnx_path: Path) -> Any:
     import onnx
@@ -52,6 +66,10 @@ def _get_attr(node: Any, name: str, default: Any = None) -> Any:
                 return attr.f
     return default
 
+
+# -----------------------------------------------------------------------------
+# Bias Extraction Helpers (MatMul / MatMulInteger chains)
+# -----------------------------------------------------------------------------
 
 def _try_get_matmul_bias_from_add(
     model: Any,
@@ -112,6 +130,10 @@ def _try_get_bias_from_add_chain(
     return None
 
 
+# -----------------------------------------------------------------------------
+# Value/Shape Resolution (Reshape, Constant)
+# -----------------------------------------------------------------------------
+
 def _build_value_to_array(model: Any, inits: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     from onnx.numpy_helper import to_array
     result: Dict[str, np.ndarray] = dict(inits)
@@ -139,6 +161,10 @@ def _get_node_op_type(node: Any) -> str:
     return node.op_type
 
 
+# -----------------------------------------------------------------------------
+# Layer Extraction from ONNX Graph
+# -----------------------------------------------------------------------------
+
 def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
 
     model = _load_onnx(onnx_path)
@@ -155,6 +181,7 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
         is_qlinear_gemm = node.op_type == "QLinearGemm"
         is_fused_matmul = op_type == "com.microsoft::FusedMatMul"
 
+        # --- Gemm / QLinearMatMul / QLinearGemm / FusedMatMul ---
         if node.op_type == "Gemm" or is_qlinear_matmul or is_qlinear_gemm or is_fused_matmul:
             fc_counter += 1
             name = f"fc{fc_counter}"
@@ -242,6 +269,7 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
                 "out_features": out_features,
             })
 
+        # --- MatMul (float or pre-quantized) ---
         elif node.op_type == "MatMul":
             inputs = list(node.input)
             if len(inputs) < 2:
@@ -272,6 +300,7 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
                 "out_features": out_features,
             })
 
+        # --- MatMulInteger (dynamic int8 quantization) ---
         elif node.op_type == "MatMulInteger":
             # Dynamic quantization: int8 activations * int8 weights -> int32
             # Dequantize B to float for RTL flow (scale 1/128 for symmetric int8)
@@ -318,6 +347,10 @@ def extract_layers_from_onnx(onnx_path: Path) -> Tuple[List[Any], int]:
 
     return layers, input_size
 
+
+# -----------------------------------------------------------------------------
+# CLI Entry Point and Main Pipeline
+# -----------------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -374,6 +407,18 @@ def main() -> int:
         help="RTL structure: 'hierarchical' (separate modules) or 'flattened' (single inlined module). Default: hierarchical",
     )
     parser.add_argument(
+        "--parameterized-layers",
+        action="store_true",
+        default=True,
+        help="Use parameterized fc_in_layer/fc_out_layer (default: True).",
+    )
+    parser.add_argument(
+        "--no-parameterized-layers",
+        action="store_false",
+        dest="parameterized_layers",
+        help="Use per-layer fc_layer_fc1, fc_out_layer_fcN instead of parameterized layers.",
+    )
+    parser.add_argument(
         "--inspect",
         action="store_true",
         help="Print ONNX graph structure (node types, inputs) and exit",
@@ -383,10 +428,12 @@ def main() -> int:
     onnx_path = args.onnx_model.resolve()
     out_dir = args.out_dir.resolve()
 
+    # Validate input
     if not onnx_path.exists():
         LOGGER.error(f"ONNX model not found: {onnx_path}")
         return 1
 
+    # Inspect mode: print graph structure and exit
     if args.inspect:
         model = _load_onnx(onnx_path)
         node_types: Dict[str, int] = {}
@@ -401,7 +448,7 @@ def main() -> int:
             print(f"  {op}: {node.name} <- [{ins}]")
         return 0
 
-    # 1. Auto-detect quantization via detect_quant_type 
+    # Step 1: Auto-detect quantization via detect_quant_type 
     from detect_quant_type import detect_quantization_type, quant_type_to_bits
 
     if args.weight_format:
@@ -413,7 +460,7 @@ def main() -> int:
 
     weight_format_bits = quant_type_to_bits(quant_type)
 
-    # 2. Extract FC layers from ONNX
+    # Step 2: Extract FC layers from ONNX
     LOGGER.info("Extracting layers from ONNX...")
     layers_raw, input_size = extract_layers_from_onnx(onnx_path)
 
@@ -436,7 +483,7 @@ def main() -> int:
     last_out = layers_raw[-1]["out_features"]
     LOGGER.info(f"Output classes: {last_out} (binary: 1 or 2)")
 
-    # 3. Build LayerInfo and quantize
+    # Step 3: Build LayerInfo objects and add flatten/ReLU structure
     from rtl_mapper import (
         LayerInfo,
         float_to_int,
@@ -447,7 +494,12 @@ def main() -> int:
         generate_bias_rom,
         generate_fc_layer_wrapper,
         generate_fc_out_layer,
+        generate_proj_roms,
+        generate_proj_mem_files,
+        generate_fc_in_layer_parameterized,
+        generate_fc_out_layer_parameterized,
         generate_top_module,
+        generate_axi4_stream_wrapper,
         generate_flattened_top_module,
         generate_wrapper_module,
         generate_testbench,
@@ -455,6 +507,7 @@ def main() -> int:
         generate_netlist_json,
         generate_rtl_filelist,
         emit_legacy_rtl_outputs,
+        emit_binaryclass_nn_format,
     )
 
     layers: List[LayerInfo] = []
@@ -479,7 +532,7 @@ def main() -> int:
             full_layers.append(LayerInfo(name=f"relu_{i+1}", layer_type="relu"))
     layers = full_layers
 
-    # 4. Setup output directories (binaryclass_nn format: flat layout)
+    # Step 4: Setup output directories (binaryclass_nn format: flat layout)
     out_dir.mkdir(parents=True, exist_ok=True)
     sv_dir = out_dir
     sv_dir.mkdir(parents=True, exist_ok=True)
@@ -488,7 +541,7 @@ def main() -> int:
     tb_sim_dir = out_dir / "tb" / "sim"
     tb_sim_dir.mkdir(parents=True, exist_ok=True)
 
-    # 5. Generate .mem files (binaryclass_nn format: mem_files/fc1_weights.mem)
+    # Step 5: Generate .mem files (binaryclass_nn format: mem_files/fc1_weights.mem)
     LOGGER.info(f"Writing .mem files (int{weight_format_bits})...")
     for layer in layers:
         if layer.layer_type != "linear":
@@ -507,7 +560,7 @@ def main() -> int:
         generate_quant_pkg_style_bias_mem(bq, bias_mem_path, layer.out_features or 0, weight_format_bits)
         LOGGER.info(f"  {layer.name}: {layer.in_features} -> {layer.out_features}")
 
-    # 6. Emit legacy RTL if requested
+    # Step 6: Emit legacy RTL if requested
     if args.emit_rtl_legacy:
         legacy_dir = out_dir.parent / "legacy_out" if out_dir.name == "my_ip" else out_dir / "legacy"
         legacy_dir.mkdir(parents=True, exist_ok=True)
@@ -520,8 +573,23 @@ def main() -> int:
         )
 
     model_name = onnx_path.stem
-    use_flattened = args.rtl_structure == "flattened"
     linear_layers = [l for l in layers if l.layer_type == "linear"]
+    # Default: binaryclass_nn format when 3 FC layers; else hierarchical
+    use_binaryclass_nn = (
+        len(linear_layers) == 3
+        and all(l.name == f"fc{i+1}" for i, l in enumerate(linear_layers))
+    )
+    use_flattened = args.rtl_structure == "flattened" and not use_binaryclass_nn
+
+    if use_binaryclass_nn:
+        LOGGER.info("Generating binaryclass_nn format (binaryclass_NN, AXI4-Stream, reference structure)...")
+        emit_binaryclass_nn_format(out_dir, layers, input_size, weight_format_bits, args.scale)
+        generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, 8)
+        generate_netlist_json(out_dir, model_name, layers)
+        generate_rtl_filelist(out_dir, model_name, layers, binaryclass_nn_format=True)
+        LOGGER.info(f"Binaryclass_nn format RTL generation complete! Output: {out_dir}")
+        return 0
+
     if use_flattened and len(linear_layers) < 3:
         LOGGER.warning(
             f"Flattened RTL requires at least 3 FC layers; found {len(linear_layers)}. "
@@ -529,7 +597,7 @@ def main() -> int:
         )
         use_flattened = False
 
-    # 7. Write embedded RTL templates (quant_pkg always needed; submodules only for hierarchical)
+    # Step 7: Write embedded RTL templates (quant_pkg always needed; submodules only for hierarchical)
     LOGGER.info("Writing RTL templates...")
     write_embedded_rtl_templates(sv_dir, weight_format_bits, write_submodules=not use_flattened)
 
@@ -543,34 +611,53 @@ def main() -> int:
     else:
         # 8b. Hierarchical: ROM, layer, and top modules
         LOGGER.info("Generating hierarchical RTL structure...")
-        for layer in layers:
-            if layer.layer_type == "linear":
-                generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
-                generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
-                if layer.name == "fc1":
-                    generate_fc_layer_wrapper(
-                        layer.name, layer.in_features or 0, layer.out_features or 0,
-                        args.data_width, weight_format_bits, sv_dir,
-                    )
-                else:
-                    generate_fc_out_layer(
-                        layer.name, layer.out_features or 0, layer.in_features or 0, sv_dir,
-                    )
+        if args.parameterized_layers:
+            LOGGER.info("  Using parameterized fc_in_layer / fc_out_layer...")
+            generate_proj_mem_files(layers, mem_dir, args.scale, weight_format_bits)
+            generate_proj_roms(layers, weight_format_bits, sv_dir, mem_dir)
+            generate_fc_in_layer_parameterized(layers, weight_format_bits, sv_dir)
+            generate_fc_out_layer_parameterized(layers, weight_format_bits, sv_dir)
+            generate_top_module(
+                model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir,
+                use_parameterized_layers=True,
+            )
+            generate_axi4_stream_wrapper(model_name, layers, weight_format_bits, sv_dir)
+        else:
+            for layer in layers:
+                if layer.layer_type == "linear":
+                    generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
+                    generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
+                    if layer.name == "fc1":
+                        generate_fc_layer_wrapper(
+                            layer.name, layer.in_features or 0, layer.out_features or 0,
+                            args.data_width, weight_format_bits, sv_dir,
+                        )
+                    else:
+                        generate_fc_out_layer(
+                            layer.name, layer.out_features or 0, layer.in_features or 0, sv_dir,
+                        )
 
-        LOGGER.info("Generating top module...")
-        generate_top_module(model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir)
+            LOGGER.info("Generating top module...")
+            generate_top_module(
+                model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir,
+                use_parameterized_layers=False,
+            )
+            generate_axi4_stream_wrapper(model_name, layers, weight_format_bits, sv_dir)
 
-    # 10. Testbench
+    # Step 8: Testbench (optional)
     if args.emit_testbench:
         last_fc = next((l for l in reversed(layers) if l.layer_type == "linear"), None)
         if last_fc:
             generate_testbench(model_name, input_size, last_fc.out_features or 0, weight_format_bits, tb_sim_dir)
 
-    # 11. Reports
+    # Step 9: Reports (mapping report, netlist JSON, RTL filelist)
     frac_bits = 8
     generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, frac_bits)
     generate_netlist_json(out_dir, model_name, layers)
-    generate_rtl_filelist(out_dir, model_name, layers)
+    generate_rtl_filelist(
+        out_dir, model_name, layers,
+        parameterized_layers=(not use_flattened and args.parameterized_layers),
+    )
 
     LOGGER.info(f"Binary classifier RTL generation complete! Output: {out_dir}")
     return 0

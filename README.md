@@ -1,33 +1,42 @@
 # Binary Classification ONNX to RTL
 
-Convert binary classification ONNX models (fully connected layers) to RTL and `.mem` files. Supports 1 output (sigmoid) or 2 outputs (softmax)Uses `detect_quant_type.py` for autodetection of quantization (int4, int8, int16)
+Convert binary classification ONNX models (fully connected layers) to RTL and `.mem` files.  Uses `detect_quant_type.py` for autodetection of quantization (int4, int8, int16)
 
 ## Requirements
 
 - **Python 3.8+**
-- **PyTorch**  for rtl_mapper
-- **ONNX**  from `onnx_lib_path`
-- **convert_model_to_RTL**  sibling directory with `rtl_mapper`
+- **PyTorch** (for rtl_mapper)
+- **ONNX** (from `onnx_lib_path`)
+- **convert_model_to_RTL** sibling directory with `onnx_lib`
 
 ## ONNX to RTL
 
 ```bash
-# Convert binary classifier ONNX to RTL + .mem (quantization autodetected)
-python binary_onnx_to_RTL.py --onnx-model path/to/model.onnx --out-dir ./my_ip
+# Convert binary classifier ONNX to RTL + .mem (quantization auto-detected)
+python binary_onnx_to_rtl.py --onnx-model path/to/model.onnx --out-dir ./my_ip
 
 # With testbench
-python binary_onnx_to_RTL.py --onnx-model model.onnx --out-dir ./output --emit-testbench
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --emit-testbench
 
-# Flattened RTL structure (single inlined module, like binaryclass_NN_core_flatten.sv)
-python binary_onnx_to_RTL.py --onnx-model model.onnx --out-dir ./output --rtl-structure flattened
+# Hierarchical RTL (default): parameterized fc_in_layer, fc_out_layer, ROMs
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --rtl-structure hierarchical
+
+# Flattened RTL structure (single inlined module)
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --rtl-structure flattened
+
+# Per-layer modules (fc_layer_fc1, fc_out_layer_fc2,...) instead of parameterized
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --no-parameterized-layers
 
 # Override quantization
-python binary_onnx_to_RTL.py --onnx-model model.onnx --out-dir ./output --weight-format int8
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --weight-format int8
+
+# Inspect ONNX graph structure
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --inspect
 ```
 
 ## Quantization Detection
 
-`binary_onnx_to_RTL.py` uses `detect_quant_type.py` in the same folder:
+`binary_onnx_to_rtl.py` uses `detect_quant_type.py` in the same folder:
 
 ```bash
 # From ONNX model
@@ -42,12 +51,11 @@ python detect_quant_type.py --checkpoint path/to/model.pth
 
 ## Supported Models
 
-- **FC only**: Gemm, MatMul, QLinearMatMul, QLinearGemm
+- **FC only**: Gemm, MatMul, QLinearMatMul, QLinearGemm, FusedMatMul, MatMulInteger
 - **CNN to FC**: MatMul after Reshape
-- **Output**: 1 (sigmoid) or 2 (softmax) classes
 
 ## Output
 
-- `src/rtl/systemverilog/` RTL modules, quant_pkg, ROMs
-- `src/rtl/systemverilog/mem/` weight and bias `.mem` files
-- `mapping_report.txt`, `netlist.json`
+- **RTL modules** in `--out-dir`: `quant_pkg.sv`, `fc_in_layer.sv`, `fc_out_layer.sv`, `fc_proj_in_weights_rom.sv`, `fc_proj_out_weights_rom.sv`, etc.
+- **Memory files** in `--out-dir/mem_files/`: `fc_proj_in_weights.mem`, `fc_proj_in_bias.mem`, etc.
+- **Reports**: `mapping_report.txt`, `netlist.json`, `rtl_filelist.f`
