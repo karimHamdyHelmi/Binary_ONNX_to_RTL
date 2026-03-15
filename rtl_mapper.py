@@ -3,20 +3,80 @@
 Minimal rtl_mapper for binary_onnx_to_rtl.py.
 Contains only the functions needed for ONNX-to-RTL conversion (no PyTorch model loading).
 Output format matches binaryclass_nn: PyramidTech header, clk_i/rst_n_i, _s/_q suffixes, etc.
+Uses reusable templates from binaryclass_nn/ (without headers) when available.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Reusable Templates
+# -----------------------------------------------------------------------------
+
+_RTL_MAPPER_DIR = Path(__file__).resolve().parent
+BINARYCLASS_NN_TEMPLATES_DIR = _RTL_MAPPER_DIR / "binaryclass_nn"
+
+# Reusable template filenames (used without changes, headers stripped)
+_REUSABLE_TEMPLATES = (
+    "mac.sv",
+    "fc_in.sv",
+    "fc_out.sv",
+    "relu_layer.sv",
+    "sigmoid_layer.sv",
+    "sync_fifo.sv",
+    "quant_pkg.sv",
+)
+
+
+def _strip_pyramidtech_header(content: str) -> str:
+    """Remove PyramidTech header block. Return RTL content from first `begin_keywords or package."""
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("`") or (s.startswith("package") and "quant_pkg" in s):
+            result = "\n".join(lines[i:])
+            return result + "\n" if content.endswith("\n") else result
+    return content
+
+
+def _load_reusable_template(filename: str) -> Optional[str]:
+    """Load template from binaryclass_nn/ and strip header. Returns None if file not found."""
+    path = BINARYCLASS_NN_TEMPLATES_DIR / filename
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+        return _strip_pyramidtech_header(content)
+    except Exception as e:
+        LOGGER.warning(f"Could not load template {filename}: {e}")
+        return None
+
+
+def _get_quant_pkg_from_template(weight_width: int) -> str:
+    """Get quant_pkg content: use binaryclass_nn template + Q_INT define, or fallback to embedded."""
+    template = _load_reusable_template("quant_pkg.sv")
+    if template:
+        return f"`define Q_INT{weight_width}\n" + template
+    return _get_quant_pkg_content(weight_width)
+
+
+def _write_template_or_embedded(sv_dir: Path, filename: str, template_content: Optional[str], embedded_content: str) -> None:
+    """Write template from binaryclass_nn (no header) if available, else embedded."""
+    content = template_content if template_content else _pyramidtech_wrap(embedded_content, filename, "")
+    (sv_dir / filename).write_text(content.rstrip() + "\n", encoding="utf-8")
+
 
 # -----------------------------------------------------------------------------
 # Formatting Helpers (q_data declarations)
@@ -89,6 +149,8 @@ class LayerInfo:
     bias: Optional[torch.Tensor] = None
     in_shape: Optional[Tuple[int, ...]] = None
     out_shape: Optional[Tuple[int, ...]] = None
+    quant_params: Optional[Dict[str, Any]] = None  # ONNX: weight_scale, b_zero_point, etc.
+    activation: Optional[str] = None  # ONNX: Relu, Sigmoid, Tanh, etc. (from graph trace)
 
 
 # -----------------------------------------------------------------------------
@@ -200,11 +262,23 @@ def generate_proj_mem_files(
     mem_dir: Path,
     scale: int,
     bit_width: int,
+    *,
+    binaryclass_nn_layout: bool = False,
+    six_layer_blocks: bool = False,
 ) -> None:
-    """Generate .mem files with fc_N_proj_in/out naming for parameterized hierarchical flow."""
+    """Generate .mem files with fc_N_proj_in/out naming (binaryclass_nn style per layer block).
+    When binaryclass_nn_layout=True: write to mem_dir root, one proj_in + proj_out per layer block.
+    When six_layer_blocks=True and 6 layers: iterate over 3 blocks (fc1+fc2, fc3+fc4, fc5+fc6)."""
     linear_layers = [l for l in layers if l.layer_type == "linear"]
-    for idx, layer in enumerate(linear_layers):
-        prefix = _proj_prefix(idx)
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    if six_layer_blocks and len(linear_layers) == 6:
+        block_indices = [(0, 1), (2, 3), (4, 5)]
+    else:
+        block_indices = [(i, i + 1) if i + 1 < len(linear_layers) else (i, None) for i in range(len(linear_layers))]
+    for block_idx, (layer_idx, next_idx) in enumerate(block_indices):
+        layer = linear_layers[layer_idx]
+        next_layer = linear_layers[next_idx] if next_idx is not None else None
+        prefix = _proj_prefix(block_idx)
         w_np = layer.weight.detach().cpu().numpy().astype(np.float32)
         b_np = layer.bias.detach().cpu().numpy().astype(np.float32) if layer.bias is not None else np.zeros((layer.out_features or 0,), dtype=np.float32)
         wq = float_to_int(w_np, scale, bit_width)
@@ -212,12 +286,12 @@ def generate_proj_mem_files(
         in_f = layer.in_features or 0
         out_f = layer.out_features or 0
 
-        (mem_dir / f"{prefix}_in_weights.mem").parent.mkdir(parents=True, exist_ok=True)
+        # proj_in: weights + bias (per layer block, as in binaryclass_nn)
         generate_quant_pkg_style_weight_mem(wq, mem_dir / f"{prefix}_in_weights.mem", "fc1", in_f, out_f, bit_width)
         generate_proj_bias_mem_acc(bq, mem_dir / f"{prefix}_in_bias.mem", out_f, bit_width)
 
-        if idx + 1 < len(linear_layers):
-            next_layer = linear_layers[idx + 1]
+        # proj_out: next layer weights + bias (per layer block, as in binaryclass_nn)
+        if next_layer is not None:
             next_w = next_layer.weight.detach().cpu().numpy().astype(np.float32)
             next_b = next_layer.bias.detach().cpu().numpy().astype(np.float32) if next_layer.bias is not None else np.zeros((next_layer.out_features or 0,), dtype=np.float32)
             next_wq = float_to_int(next_w, scale, bit_width)
@@ -226,6 +300,13 @@ def generate_proj_mem_files(
             next_out = next_layer.out_features or 0
             generate_quant_pkg_style_weight_mem(next_wq, mem_dir / f"{prefix}_out_weights.mem", "fc2", next_in, next_out, bit_width)
             generate_proj_out_bias_mem(next_bq, mem_dir / f"{prefix}_out_bias.mem", bit_width)
+        else:
+            # Last layer: proj_out is 1x1 (binary output, as in binaryclass_nn)
+            next_out = 1
+            w_out = float_to_int(np.eye(1, out_f, dtype=np.float32) * (scale / 256.0), scale, bit_width) if out_f == 1 else float_to_int(np.zeros((1, out_f), dtype=np.float32), scale, bit_width)
+            bq_out = float_to_int(np.array([float(bq[0])] if out_f >= 1 else [0.0], dtype=np.float32), scale, bit_width)
+            generate_quant_pkg_style_weight_mem(w_out, mem_dir / f"{prefix}_out_weights.mem", "fc2", out_f, next_out, bit_width)
+            generate_proj_out_bias_mem(bq_out, mem_dir / f"{prefix}_out_bias.mem", bit_width)
 
 
 def generate_quant_pkg_style_mems(
@@ -781,14 +862,14 @@ BINARYCLASS_MAC_SV = '''`timescale 1ns/1ps
 import quant_pkg::*;
 
 module mac (
-    input  logic clk,
-    input  logic rst_n,
-    input  logic enable,
-    input  logic clear,
-    input  q_data_t a,
-    input  q_data_t b,
-    output acc_t acc,
-    output logic valid_out
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic enable_i,
+    input  logic clear_i,
+    input  q_data_t a_i,
+    input  q_data_t b_i,
+    output acc_t acc_o,
+    output logic valid_o
 );
 
     q_mult_t mult_reg;
@@ -796,46 +877,46 @@ module mac (
     logic enable_q;
     logic enable_qq;
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i)
             mult_reg <= '0;
-        else if (clear)
+        else if (clear_i)
             mult_reg <= '0;
-        else if (enable)
-            mult_reg <= $signed(a) * $signed(b);
+        else if (enable_i)
+            mult_reg <= $signed(a_i) * $signed(b_i);
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i)
             acc_reg <= '0;
-        else if (clear)
+        else if (clear_i)
             acc_reg <= '0;
         else if (enable_q)
             acc_reg <= acc_reg + mult_reg;
     end
 
-    always_ff @(posedge clk) begin
+    always_ff @(posedge clk_i) begin
         if (acc_reg > $signed(ACC_FULL_MAX))
-            acc <= ACC_FULL_MAX;
+            acc_o <= ACC_FULL_MAX;
         else if (acc_reg < $signed(ACC_FULL_MIN))
-            acc <= ACC_FULL_MIN;
+            acc_o <= ACC_FULL_MIN;
         else
-            acc <= acc_reg[4*Q_WIDTH-1:0];
+            acc_o <= acc_reg[4*Q_WIDTH-1:0];
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
             enable_q  <= 1'b0;
             enable_qq <= 1'b0;
-            valid_out <= 1'b0;
-        end else if (clear) begin
+            valid_o   <= 1'b0;
+        end else if (clear_i) begin
             enable_q  <= 1'b0;
             enable_qq <= 1'b0;
-            valid_out <= 1'b0;
+            valid_o   <= 1'b0;
         end else begin
-            enable_q  <= enable;
+            enable_q  <= enable_i;
             enable_qq <= enable_q;
-            valid_out <= enable_qq;
+            valid_o   <= enable_qq;
         end
     end
 
@@ -851,14 +932,14 @@ module fc_in #(
     parameter signed BIAS_SCALE  = 0,
     parameter signed LAYER_SCALE = 12
 )(
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-    input  q_data_t data_in,
-    input  q_data_t weights[NUM_NEURONS],
-    input  acc_t biases[NUM_NEURONS],
-    output q_data_t data_out[NUM_NEURONS],
-    output logic valid_out
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic valid_i,
+    input  q_data_t data_i,
+    input  q_data_t weights_i[NUM_NEURONS],
+    input  acc_t biases_i[NUM_NEURONS],
+    output q_data_t data_o[NUM_NEURONS],
+    output logic valid_o
 );
 
     acc_t mac_acc[NUM_NEURONS];
@@ -875,32 +956,32 @@ module fc_in #(
     generate
         for (i = 0; i < NUM_NEURONS; i = i + 1) begin : FC_MACS
             mac u_mac (
-                .clk(clk),
-                .rst_n(rst_n),
-                .enable(mac_enable),
-                .clear(mac_clear),
-                .a(data_in),
-                .b(weights[i]),
-                .valid_out(mac_valid_out[i]),
-                .acc(mac_acc[i])
+                .clk_i(clk_i),
+                .rst_n_i(rst_n_i),
+                .enable_i(mac_enable),
+                .clear_i(mac_clear),
+                .a_i(data_i),
+                .b_i(weights_i[i]),
+                .valid_o(mac_valid_out[i]),
+                .acc_o(mac_acc[i])
             );
         end
     endgenerate
 
     assign all_mac_valid = &mac_valid_out;
-    assign mac_enable = valid_in;
-    assign mac_clear  = valid_out;
+    assign mac_enable = valid_i;
+    assign mac_clear  = valid_o;
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
             count_out <= '0;
-            valid_out <= 1'b0;
+            valid_o   <= 1'b0;
         end else begin
-            valid_out <= 1'b0;
+            valid_o <= 1'b0;
             if (all_mac_valid) begin
                 if (count_out == INPUT_SIZE-1) begin
                     count_out <= 0;
-                    valid_out <= 1'b1;
+                    valid_o   <= 1'b1;
                 end else begin
                     count_out <= count_out + 1'b1;
                 end
@@ -910,19 +991,19 @@ module fc_in #(
 
     generate
         for (i = 0; i < NUM_NEURONS; i++) begin : FC_BIAS_ADD
-            assign bias_aligned[i] = (BIAS_SCALE >= 0) ? (biases[i] <<< BIAS_SCALE) : (biases[i] >>> -BIAS_SCALE);
+            assign bias_aligned[i] = (BIAS_SCALE >= 0) ? (biases_i[i] <<< BIAS_SCALE) : (biases_i[i] >>> -BIAS_SCALE);
             assign acc_tmp[i] = mac_acc[i] + bias_aligned[i];
             assign data_out_temp[i] = (LAYER_SCALE >= 0) ? (acc_tmp[i] >>> LAYER_SCALE) : (acc_tmp[i] <<< -LAYER_SCALE);
-            always_ff @(posedge clk or negedge rst_n) begin
-                if (!rst_n)
-                    data_out[i] <= '0;
+            always_ff @(posedge clk_i or negedge rst_n_i) begin
+                if (!rst_n_i)
+                    data_o[i] <= '0;
                 else if (count_out == INPUT_SIZE-1) begin
                     if (data_out_temp[i] > ACC_Q_MAX)
-                        data_out[i] <= Q_MAX;
+                        data_o[i] <= Q_MAX;
                     else if (data_out_temp[i] < ACC_Q_MIN)
-                        data_out[i] <= Q_MIN;
+                        data_o[i] <= Q_MIN;
                     else
-                        data_out[i] <= data_out_temp[i][Q_WIDTH-1:0];
+                        data_o[i] <= data_out_temp[i][Q_WIDTH-1:0];
                 end
             end
         end
@@ -939,14 +1020,14 @@ module fc_out #(
     parameter signed LAYER_SCALE = 5,
     parameter signed BIAS_SCALE  = 1
 )(
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-    input  q_data_t data_in[NUM_NEURONS],
-    input  q_data_t weights[NUM_NEURONS],
-    input  acc_t bias,
-    output q_data_t data_out,
-    output logic valid_out
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic valid_i,
+    input  q_data_t data_i[NUM_NEURONS],
+    input  q_data_t weights_i[NUM_NEURONS],
+    input  acc_t bias_i,
+    output q_data_t data_o,
+    output logic valid_o
 );
 
     acc_t mult_res[NUM_NEURONS];
@@ -961,12 +1042,12 @@ module fc_out #(
     genvar i;
     generate
         for (i = 0; i < NUM_NEURONS; i = i + 1) begin : GEN_MULT
-            assign mult_res[i] = $signed(data_in[i]) * $signed(weights[i]);
+            assign mult_res[i] = $signed(data_i[i]) * $signed(weights_i[i]);
         end
     endgenerate
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
             for (int j = 0; j < NUM_NEURONS; j++)
                 mult_pipe[j] <= '0;
             valid_p1 <= 1'b0;
@@ -974,8 +1055,8 @@ module fc_out #(
         end else begin
             for (int j = 0; j < NUM_NEURONS; j++)
                 mult_pipe[j] <= mult_res[j];
-            valid_p1 <= valid_in;
-            bias_pipe <= bias;
+            valid_p1 <= valid_i;
+            bias_pipe <= bias_i;
         end
     end
 
@@ -992,8 +1073,8 @@ module fc_out #(
             sum_stage2 = sum_stage2_tmp <<< -LAYER_SCALE;
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
             sum_pipe2 <= '0;
             valid_p2  <= 1'b0;
         end else begin
@@ -1002,18 +1083,18 @@ module fc_out #(
         end
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            data_out  <= '0;
-            valid_out <= 1'b0;
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
+            data_o  <= '0;
+            valid_o <= 1'b0;
         end else begin
-            valid_out <= valid_p2;
+            valid_o <= valid_p2;
             if (sum_pipe2 > ACC_Q_MAX)
-                data_out <= Q_MAX;
+                data_o <= Q_MAX;
             else if (sum_pipe2 < ACC_Q_MIN)
-                data_out <= Q_MIN;
+                data_o <= Q_MIN;
             else
-                data_out <= sum_pipe2[Q_WIDTH-1:0];
+                data_o <= sum_pipe2[Q_WIDTH-1:0];
         end
     end
 
@@ -1024,22 +1105,22 @@ BINARYCLASS_RELU_LAYER_SV = '''`timescale 1ns/1ps
 import quant_pkg::*;
 
 module relu_layer (
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-    input  q_data_t data_in,
-    output q_data_t data_out,
-    output logic valid_out
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic valid_i,
+    input  q_data_t data_i,
+    output q_data_t data_o,
+    output logic valid_o
 );
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            data_out  <= 8'd0;
-            valid_out <= 1'b0;
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
+            data_o  <= 8'd0;
+            valid_o <= 1'b0;
         end else begin
-            valid_out <= valid_in;
-            if (valid_in)
-                data_out <= (data_in < 0) ? 8'd0 : data_in;
+            valid_o <= valid_i;
+            if (valid_i)
+                data_o <= (data_i < 0) ? 8'd0 : data_i;
         end
     end
 
@@ -1050,25 +1131,25 @@ BINARYCLASS_SIGMOID_LAYER_SV = '''`timescale 1ns/1ps
 import quant_pkg::*;
 
 module sigmoid_layer (
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-    input  q_data_t data_in,
-    output q_data_t data_out,
-    output logic valid_out
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic valid_i,
+    input  q_data_t data_i,
+    output q_data_t data_o,
+    output logic valid_o
 );
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            data_out  <= 8'd0;
-            valid_out <= 1'b0;
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
+            data_o  <= 8'd0;
+            valid_o <= 1'b0;
         end else begin
-            valid_out <= valid_in;
-            if (valid_in) begin
-                if (data_in >= 0)
-                    data_out <= SIGMOID_MAX;
+            valid_o <= valid_i;
+            if (valid_i) begin
+                if (data_i >= 0)
+                    data_o <= SIGMOID_MAX;
                 else
-                    data_out <= SIGMOID_MIN;
+                    data_o <= SIGMOID_MIN;
             end
         end
     end
@@ -1125,20 +1206,349 @@ module sync_fifo #(
 endmodule : sync_fifo
 '''
 
+# Embedded binaryclass_NN top module (default structure, params substituted from ONNX)
+BINARYCLASS_NN_SV = r'''`begin_keywords "1800-2012"
+module binaryclass_NN 
+  import quant_pkg::*;
+#(
+  parameter int FC_1_NEURONS          = 32'd30,  
+  parameter int FC_2_NEURONS          = 32'd5,   
+  parameter int FC_3_NEURONS          = 32'd1,   
+  parameter int FC_1_INPUT_SIZE       = 32'd720, 
+  parameter int FC_2_INPUT_SIZE       = 32'd45,  
+  parameter int FC_3_INPUT_SIZE       = 32'd5,   
+  parameter int FC_1_ROM_DEPTH        = 32'd45,  
+  parameter int FC_2_ROM_DEPTH        = 32'd5,   
+  parameter int FC_3_ROM_DEPTH        = 32'd1, 
+  parameter int FC_1_IN_LAYER_SCALE   = 32'd12,
+  parameter int FC_1_IN_BIAS_SCALE    = 32'd0,
+  parameter int FC_1_OUT_LAYER_SCALE  = 32'd7,
+  parameter int FC_1_OUT_BIAS_SCALE   = 32'd0,
+  parameter int FC_2_IN_LAYER_SCALE   = 32'd7,
+  parameter int FC_2_IN_BIAS_SCALE    = 32'd0,
+  parameter int FC_2_OUT_LAYER_SCALE  = 32'd7,
+  parameter int FC_2_OUT_BIAS_SCALE   = 32'd0,
+  parameter int FC_3_IN_LAYER_SCALE   = 32'd7,
+  parameter int FC_3_IN_BIAS_SCALE    = 32'd0,
+  parameter int FC_3_OUT_LAYER_SCALE  = 32'd6,
+  parameter int FC_3_OUT_BIAS_SCALE   = 32'd0,
+  parameter int FIFO_DEPTH            = 32'd1024  
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  // AXI4-Stream Slave Interface: Data applied for prediction
+  input  q_data_t s_axis_tdata_i,
+  input  logic    s_axis_tvalid_i,
+  input  logic    s_axis_tlast_i,
+
+  // AXI4-Stream Master Interface: Prediction result data
+  output logic [DATA_WIDTH-1:0]       m_axis_prediction_tdata_o,
+  output logic [KEEP_WIDTH-1:0]       m_axis_prediction_tkeep_o,
+  output logic                        m_axis_prediction_tvalid_o,
+  input  logic                        m_axis_prediction_tready_i,
+  output logic                        m_axis_prediction_tlast_o
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // -------------------------------------------------------------------------
+  // Internal signals (Suffixes: _s = signal/wire, _q = register/flop)
+  // -------------------------------------------------------------------------
+  
+  // Layer 1 signals
+  q_data_t fc1_out_s[FC_1_NEURONS];
+  logic    fc1_valid_s;
+  q_data_t fc1_pre_relu_s;
+  q_data_t fc1_post_relu_s;
+  logic    relu1_valid_i_s;
+  logic    relu1_valid_o_s;
+
+  // Layer 2 signals
+  q_data_t fc2_out_s[FC_2_NEURONS];
+  logic    fc2_valid_s;
+  q_data_t fc2_pre_relu_s;
+  q_data_t fc2_post_relu_s;
+  logic    relu2_valid_i_s;
+  logic    relu2_valid_o_s;
+
+  // Layer 3 signals
+  q_data_t fc3_out_s[FC_3_NEURONS];
+  logic    fc3_valid_s;
+  logic    sigmoid_valid_i_s;
+  logic    sigmoid_valid_o_s;
+  q_data_t sigmoid_data_s;
+  q_data_t logits_s;
+
+  //FIFO signals
+  logic fifo_empty_s;
+  logic fifo_empty_q;
+  logic fifo_full_s;
+  logic fifo_write_en_s; 
+  logic fifo_read_en_s; 
+  logic fifo_read_en_q; 
+  logic [DATA_WIDTH-1:0] fifo_read_data_s;
+  logic [DATA_WIDTH-1:0] fifo_write_data_s;
+  // Registered counter for output stream tracking
+  logic [$clog2(FC_3_ROM_DEPTH + 1) - 1:0] out_count_q;
+
+  logic tvalid_q;
+
+  // -------------------------------------------------------------------------
+  // Layer 1: Fully Connected -> Sequential ROM -> ReLU Activation
+  // -------------------------------------------------------------------------
+  fc_in_layer #(
+    .NUM_NEURONS (FC_1_NEURONS),
+    .INPUT_SIZE  (FC_1_INPUT_SIZE),
+    .BIAS_SCALE  (FC_1_IN_BIAS_SCALE),
+    .LAYER_SCALE (FC_1_IN_LAYER_SCALE)
+  ) u_fc1_in_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (s_axis_tvalid_i),
+    .data_i  (s_axis_tdata_i),
+    .data_o  (fc1_out_s),
+    .valid_o (fc1_valid_s)
+  );
+  fc_out_layer #(
+    .NUM_NEURONS (FC_1_NEURONS),
+    .ROM_DEPTH   (FC_1_ROM_DEPTH),
+    .BIAS_SCALE  (FC_1_OUT_BIAS_SCALE),
+    .LAYER_SCALE (FC_1_OUT_LAYER_SCALE)
+  ) u_fc1_out_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (fc1_valid_s),
+    .data_i  (fc1_out_s),
+    .data_o  (fc1_pre_relu_s),
+    .valid_o (relu1_valid_i_s)
+  );
+  relu_layer u_relu1 (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (relu1_valid_i_s),
+    .data_i  (fc1_pre_relu_s),
+    .data_o  (fc1_post_relu_s),
+    .valid_o (relu1_valid_o_s)
+  );
+
+  // -------------------------------------------------------------------------
+  // Layer 2: Fully Connected -> Sequential ROM -> ReLU Activation
+  // -------------------------------------------------------------------------
+  fc_in_layer #(
+    .NUM_NEURONS (FC_2_NEURONS),
+    .INPUT_SIZE  (FC_2_INPUT_SIZE),
+    .BIAS_SCALE  (FC_2_IN_BIAS_SCALE),
+    .LAYER_SCALE (FC_2_IN_LAYER_SCALE)
+  ) u_fc2_in_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (relu1_valid_o_s),
+    .data_i  (fc1_post_relu_s),
+    .data_o  (fc2_out_s),
+    .valid_o (fc2_valid_s)
+  );
+  fc_out_layer #(
+    .NUM_NEURONS (FC_2_NEURONS),
+    .ROM_DEPTH   (FC_2_ROM_DEPTH),
+    .BIAS_SCALE  (FC_2_OUT_BIAS_SCALE),
+    .LAYER_SCALE (FC_2_OUT_LAYER_SCALE)
+  ) u_fc2_out_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (fc2_valid_s),
+    .data_i  (fc2_out_s),
+    .data_o  (fc2_pre_relu_s),
+    .valid_o (relu2_valid_i_s)
+  );
+  relu_layer u_relu2 (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (relu2_valid_i_s),
+    .data_i  (fc2_pre_relu_s),
+    .data_o  (fc2_post_relu_s),
+    .valid_o (relu2_valid_o_s)
+  );
+
+  // -------------------------------------------------------------------------
+  // Layer 3: Fully Connected -> Output Engine
+  // -------------------------------------------------------------------------
+  fc_in_layer #(
+    .NUM_NEURONS (FC_3_NEURONS),
+    .INPUT_SIZE  (FC_3_INPUT_SIZE),
+    .BIAS_SCALE  (FC_3_IN_BIAS_SCALE),
+    .LAYER_SCALE (FC_3_IN_LAYER_SCALE)
+  ) u_fc3_in_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (relu2_valid_o_s),
+    .data_i  (fc2_post_relu_s),
+    .data_o  (fc3_out_s),
+    .valid_o (fc3_valid_s)
+  );
+  fc_out_layer #(
+    .NUM_NEURONS (FC_3_NEURONS),
+    .ROM_DEPTH   (FC_3_ROM_DEPTH),
+    .BIAS_SCALE  (FC_3_OUT_BIAS_SCALE),
+    .LAYER_SCALE (FC_3_OUT_LAYER_SCALE)
+  ) u_fc3_out_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (fc3_valid_s),
+    .data_i  (fc3_out_s),
+    .data_o  (logits_s),
+    .valid_o (sigmoid_valid_i_s)
+  );
+
+  sigmoid_layer u_sigmoid_layer (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .valid_i (sigmoid_valid_i_s),
+    .data_i  (logits_s),
+    .data_o  (sigmoid_data_s),
+    .valid_o (sigmoid_valid_o_s)
+  );
+
+  sync_fifo #(
+    .DATA_WIDTH(DATA_WIDTH),
+    .DEPTH     (FIFO_DEPTH)     
+) u_fifo_sigmoid (
+    .clk_i        (clk_i),
+    .rst_n_i        (rst_n_i),
+    .write_en_i   (fifo_write_en_s),
+    .write_data_i (fifo_write_data_s),
+    .full_o       (fifo_full_s),
+    .read_en_i    (fifo_read_en_s),
+    .read_data_o  (fifo_read_data_s),
+    .empty_o      (fifo_empty_s)
+);
+
+always_ff @(posedge clk_i or negedge rst_n_i) begin : fifo_read_pipe
+  if (!rst_n_i)
+    fifo_read_en_q <= 1'b0;
+  else
+    fifo_read_en_q <= fifo_read_en_s;
+end : fifo_read_pipe
+
+always_ff @(posedge clk_i or negedge rst_n_i) begin : axi_output_logic
+  if (!rst_n_i) begin
+    m_axis_prediction_tdata_o <= 32'h0;
+    tvalid_q                <= 1'b0;
+  end
+  else if (fifo_read_en_q) begin
+    m_axis_prediction_tdata_o <= fifo_read_data_s;
+    tvalid_q                <= 1'b1;
+  end
+  else if (m_axis_prediction_tready_i) begin
+    tvalid_q <= 1'b0;
+  end
+end : axi_output_logic
+
+always_ff @(posedge clk_i or negedge rst_n_i) begin : output_tracking
+  if (!rst_n_i) begin
+    out_count_q <= '0;
+  end
+  else if (m_axis_prediction_tvalid_o && m_axis_prediction_tready_i) begin
+    if (out_count_q == (FC_3_ROM_DEPTH - 1))
+      out_count_q <= '0;
+    else
+      out_count_q <= out_count_q + 1'b1;
+  end
+end : output_tracking
+
+assign fifo_write_en_s   = sigmoid_valid_o_s && !fifo_full_s;
+assign fifo_read_en_s    = !fifo_empty_s && m_axis_prediction_tready_i;
+assign fifo_write_data_s = {24'h0, sigmoid_data_s};
+
+assign m_axis_prediction_tvalid_o = tvalid_q;
+assign m_axis_prediction_tkeep_o  = 4'h1;
+assign m_axis_prediction_tlast_o = (m_axis_prediction_tvalid_o && (out_count_q == (FC_3_ROM_DEPTH - 1)));
+
+endmodule : binaryclass_NN
+`end_keywords
+'''
+
+# Embedded binaryclass_NN_wrapper (params substituted from ONNX)
+BINARYCLASS_NN_WRAPPER_SV = r'''`begin_keywords "1800-2012"
+module binaryclass_NN_wrapper 
+  import quant_pkg::*;
+#(
+  parameter int FC1_NEURONS    = 35,
+  parameter int FC2_NEURONS    = 5,
+  parameter int FC3_NEURONS    = 1,
+  parameter int FC1_INPUT_SIZE = 720,
+  parameter int FC2_INPUT_SIZE = 45,
+  parameter int FC3_INPUT_SIZE = 5,
+  parameter int FC1_ROM_DEPTH  = 45,
+  parameter int FC2_ROM_DEPTH  = 5,
+  parameter int FC3_ROM_DEPTH  = 1
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  // AXI4-Stream Slave Interface: Data applied for prediction
+  input  q_data_t s_axis_tdata_i,
+  input  logic    s_axis_tvalid_i,
+  input  logic    s_axis_tlast_i,
+
+  // AXI4-Stream Master Interface: Prediction result data
+  output logic [DATA_WIDTH-1:0]       m_axis_prediction_tdata_o,
+  output logic [KEEP_WIDTH-1:0]       m_axis_prediction_tkeep_o,
+  output logic                        m_axis_prediction_tvalid_o,
+  input  logic                        m_axis_prediction_tready_i,
+  output logic                        m_axis_prediction_tlast_o
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  binaryclass_NN #(
+    .FC_1_NEURONS    (FC1_NEURONS),
+    .FC_2_NEURONS    (FC2_NEURONS),
+    .FC_3_NEURONS    (FC3_NEURONS),
+    .FC_1_INPUT_SIZE (FC1_INPUT_SIZE),
+    .FC_2_INPUT_SIZE (FC2_INPUT_SIZE),
+    .FC_3_INPUT_SIZE (FC3_INPUT_SIZE),
+    .FC_1_ROM_DEPTH  (FC1_ROM_DEPTH),
+    .FC_2_ROM_DEPTH  (FC2_ROM_DEPTH),
+    .FC_3_ROM_DEPTH  (FC3_ROM_DEPTH)
+  ) u_binaryclass_nn (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .s_axis_tdata_i                  (s_axis_tdata_i),
+    .s_axis_tvalid_i                 (s_axis_tvalid_i),
+    .s_axis_tlast_i                  (s_axis_tlast_i),
+    .m_axis_prediction_tdata_o  (m_axis_prediction_tdata_o),
+    .m_axis_prediction_tready_i (m_axis_prediction_tready_i),
+    .m_axis_prediction_tkeep_o  (m_axis_prediction_tkeep_o),
+    .m_axis_prediction_tvalid_o (m_axis_prediction_tvalid_o),
+    .m_axis_prediction_tlast_o  (m_axis_prediction_tlast_o)
+  );
+
+endmodule : binaryclass_NN_wrapper
+`end_keywords
+'''
+
 
 def write_embedded_rtl_templates(sv_dir: Path, weight_width: int, *, write_submodules: bool = True, has_softmax: bool = False) -> None:
-    """Write embedded quant_pkg and optionally mac, fc_in, fc_out, relu_layer to sv_dir.
+    """Write RTL templates: use binaryclass_nn/ (headers stripped) when available, else embedded.
     has_softmax is accepted but ignored (no softmax generation in minimal mapper)."""
     sv_dir.mkdir(parents=True, exist_ok=True)
 
-    (sv_dir / "quant_pkg.sv").write_text(_get_quant_pkg_content(weight_width), encoding="utf-8")
+    # quant_pkg: from template + Q_INT define (detected from ONNX weight_width)
+    (sv_dir / "quant_pkg.sv").write_text(_get_quant_pkg_from_template(weight_width), encoding="utf-8")
+
     if write_submodules:
-        (sv_dir / "mac.sv").write_text(_pyramidtech_wrap(EMBEDDED_MAC_SV, "mac.sv", "Multiply-accumulate unit for FC layers."), encoding="utf-8")
-        (sv_dir / "fc_in.sv").write_text(_pyramidtech_wrap(EMBEDDED_FC_IN_SV, "fc_in.sv", "FC input compute block."), encoding="utf-8")
-        (sv_dir / "fc_out.sv").write_text(_pyramidtech_wrap(EMBEDDED_FC_OUT_SV, "fc_out.sv", "FC output compute block."), encoding="utf-8")
-        (sv_dir / "relu_layer.sv").write_text(_pyramidtech_wrap(EMBEDDED_RELU_LAYER_SV, "relu_layer.sv", "ReLU activation layer (scalar)."), encoding="utf-8")
+        # Reusable templates from binaryclass_nn/ (exact line-by-line, no headers)
+        _write_template_or_embedded(sv_dir, "mac.sv", _load_reusable_template("mac.sv"), EMBEDDED_MAC_SV)
+        _write_template_or_embedded(sv_dir, "fc_in.sv", _load_reusable_template("fc_in.sv"), EMBEDDED_FC_IN_SV)
+        _write_template_or_embedded(sv_dir, "fc_out.sv", _load_reusable_template("fc_out.sv"), EMBEDDED_FC_OUT_SV)
+        _write_template_or_embedded(sv_dir, "relu_layer.sv", _load_reusable_template("relu_layer.sv"), EMBEDDED_RELU_LAYER_SV)
+        _write_template_or_embedded(sv_dir, "sigmoid_layer.sv", _load_reusable_template("sigmoid_layer.sv"), BINARYCLASS_SIGMOID_LAYER_SV)
+        _write_template_or_embedded(sv_dir, "sync_fifo.sv", _load_reusable_template("sync_fifo.sv"), BINARYCLASS_SYNC_FIFO_SV)
         (sv_dir / "relu_layer_array.sv").write_text(_pyramidtech_wrap(EMBEDDED_RELU_LAYER_ARRAY_SV, "relu_layer_array.sv", "ReLU activation layer (array, for legacy)."), encoding="utf-8")
-        LOGGER.info("Wrote embedded RTL templates (quant_pkg, mac, fc_in, fc_out, relu_layer, relu_layer_array)")
+        LOGGER.info("Wrote RTL templates (quant_pkg, mac, fc_in, fc_out, relu_layer, sigmoid_layer, sync_fifo from binaryclass_nn or embedded)")
     else:
         LOGGER.info("Wrote quant_pkg.sv only (flattened mode)")
 
@@ -1159,8 +1569,11 @@ def generate_proj_roms(
     weight_width: int,
     out_dir: Path,
     mem_dir: Path,
+    *,
+    mem_path_prefix: str = "mem_files/",
 ) -> List[Path]:
-    """Generate ROM modules with fc_N_proj_in/out naming for parameterized hierarchical flow."""
+    """Generate ROM modules with fc_N_proj_in/out naming for parameterized hierarchical flow.
+    mem_path_prefix: path for $readmemh (e.g. 'mem_files/' or '' for binaryclass_nn root layout)."""
     linear_layers = [l for l in layers if l.layer_type == "linear"]
     paths: List[Path] = []
     for idx, layer in enumerate(linear_layers):
@@ -1173,8 +1586,8 @@ def generate_proj_roms(
         w_depth_in = in_f
         w_width_in = out_f * weight_width
         b_width_in = out_f * weight_width * 4
-        mem_in_w = f"mem_files/{prefix}_in_weights.mem"
-        mem_in_b = f"mem_files/{prefix}_in_bias.mem"
+        mem_in_w = f"{mem_path_prefix}{prefix}_in_weights.mem"
+        mem_in_b = f"{mem_path_prefix}{prefix}_in_bias.mem"
 
         body_w = f"""`timescale 1ns/1ps
 
@@ -1234,8 +1647,8 @@ endmodule
         w_depth_out = next_in
         w_width_out = in_f * weight_width
         b_width_out = weight_width * 4
-        mem_out_w = f"mem_files/{prefix}_out_weights.mem"
-        mem_out_b = f"mem_files/{prefix}_out_bias.mem"
+        mem_out_w = f"{mem_path_prefix}{prefix}_out_weights.mem"
+        mem_out_b = f"{mem_path_prefix}{prefix}_out_bias.mem"
 
         body_w_out = f"""`timescale 1ns/1ps
 
@@ -1520,14 +1933,14 @@ module fc_in_layer #(
         .LAYER_SCALE(LAYER_SCALE),
         .BIAS_SCALE(BIAS_SCALE)
     ) u_fc_in (
-        .clk(clk),
-        .rst_n(rst_n),
-        .valid_in(valid_in_reg),
-        .data_in(data_in_reg),
-        .weights(weights_rom_data),
-        .biases(bias_rom_data),
-        .data_out(data_out),
-        .valid_out(valid_out)
+        .clk_i(clk),
+        .rst_n_i(rst_n),
+        .valid_i(valid_in_reg),
+        .data_i(data_in_reg),
+        .weights_i(weights_rom_data),
+        .biases_i(bias_rom_data),
+        .data_o(data_out),
+        .valid_o(valid_out)
     );
 
 endmodule
@@ -1708,14 +2121,14 @@ module fc_out_layer #(
         .LAYER_SCALE(LAYER_SCALE),
         .BIAS_SCALE(BIAS_SCALE)
     ) u_fc_out (
-        .clk(clk),
-        .rst_n(rst_n),
-        .valid_in(valid_pipeline_reg),
-        .data_in(data_in_reg),
-        .weights(weights_rom_data_reg),
-        .bias(bias_rom_data_reg),
-        .data_out(data_out),
-        .valid_out(valid_out_engine)
+        .clk_i(clk),
+        .rst_n_i(rst_n),
+        .valid_i(valid_pipeline_reg),
+        .data_i(data_in_reg),
+        .weights_i(weights_rom_data_reg),
+        .bias_i(bias_rom_data_reg),
+        .data_o(data_out),
+        .valid_o(valid_out_engine)
     );
 
 endmodule
@@ -1988,6 +2401,218 @@ endmodule
 # Top Module Generation (hierarchical and flattened)
 # -----------------------------------------------------------------------------
 
+def _generate_top_module_binaryclass_nn_style(
+    model_name: str,
+    layers: List[LayerInfo],
+    input_size: int,
+    data_width: int,
+    weight_width: int,
+    out_dir: Path,
+    linear_layers: List[LayerInfo],
+    *,
+    final_activation: Optional[str] = None,
+    python_scale: int = 256,
+) -> Path:
+    """Generate top module in binaryclass_nn style: fc_in -> fc_out -> relu (scalar) per layer.
+    Final activation: Sigmoid (default for binary), Relu, or pass-through if unsupported.
+    LAYER_SCALE computed from dimensions and ONNX quant params."""
+    port_decls = [
+        "    input  logic clk,",
+        "    input  logic rst_n,",
+        "    input  logic valid_in,",
+        "    input  q_data_t data_in,",
+        "    output logic valid_out,",
+        "    output q_data_t data_out",
+    ]
+    signal_decls: List[str] = []
+    instantiations: List[str] = []
+    connections: List[str] = []
+
+    stream_valid = "valid_in"
+    stream_data = "data_in"
+
+    for i, fc in enumerate(linear_layers):
+        fc_name = fc.name
+        num_neurons = fc.out_features or 0
+        in_features = fc.in_features or 0
+        next_in = linear_layers[i + 1].in_features or 1 if i + 1 < len(linear_layers) else 1
+
+        fc_out_vec = f"{fc_name}_out"
+        fc_valid = f"{fc_name}_valid_out"
+        pre_act = f"{fc_name}_pre_act"
+        post_act = f"{fc_name}_post_act"
+        act_valid_i = f"{fc_name}_act_valid_i"
+        act_valid_o = f"{fc_name}_act_valid_o"
+
+        signal_decls.extend([
+            f"    logic        {fc_valid};",
+            _q_data_decl(fc_out_vec, num_neurons, "    "),
+            f"    q_data_t     {pre_act};",
+            f"    logic        {act_valid_i};",
+        ])
+        if i < len(linear_layers) - 1:
+            signal_decls.extend([
+                f"    q_data_t     {post_act};",
+                f"    logic        {act_valid_o};",
+                "",
+            ])
+        else:
+            signal_decls.append("")
+        signal_decls.append("")
+
+        # fc_in_layer: LAYER_SCALE from input_size (MAC accumulator scaling)
+        layer_scale_in = compute_layer_scale(
+            weight_width, in_features,
+            fc.quant_params.get("weight_scale") if fc.quant_params else None,
+            python_scale,
+        )
+        # fc_out_layer: LAYER_SCALE from ROM_DEPTH (next_in)
+        layer_scale_out = compute_layer_scale(weight_width, next_in, None, python_scale)
+        bias_scale_out = compute_bias_scale(weight_width, next_in, python_scale)
+
+        # fc_in_layer
+        instantiations.extend([
+            f"    fc_in_layer #(",
+            f"        .NUM_NEURONS({num_neurons}),",
+            f"        .INPUT_SIZE({in_features}),",
+            f"        .BIAS_SCALE(0),",
+            f"        .LAYER_SCALE({layer_scale_in})",
+            f"    ) u_{fc_name}_in (",
+            f"        .clk(clk),",
+            f"        .rst_n(rst_n),",
+            f"        .valid_in({stream_valid}),",
+            f"        .data_in({stream_data}),",
+            f"        .data_out({fc_out_vec}),",
+            f"        .valid_out({fc_valid})",
+            f"    );",
+            "",
+        ])
+
+        # fc_out_layer
+        instantiations.extend([
+            f"    fc_out_layer #(",
+            f"        .NUM_NEURONS({num_neurons}),",
+            f"        .ROM_DEPTH({next_in}),",
+            f"        .LAYER_SCALE({layer_scale_out}),",
+            f"        .BIAS_SCALE({bias_scale_out})",
+            f"    ) u_{fc_name}_out (",
+            f"        .clk(clk),",
+            f"        .rst_n(rst_n),",
+            f"        .valid_in({fc_valid}),",
+            f"        .data_in({fc_out_vec}),",
+            f"        .data_out({pre_act}),",
+            f"        .valid_out({act_valid_i})",
+            f"    );",
+            "",
+        ])
+
+        # Per-layer activation from ONNX (or default)
+        layer_act = fc.activation if fc.activation else ("Relu" if i < len(linear_layers) - 1 else final_activation or "Sigmoid")
+        if i < len(linear_layers) - 1:
+            # Intermediate: use detected activation or default Relu
+            if layer_act == "Relu":
+                instantiations.extend([
+                    f"    relu_layer u_relu_{i+1} (",
+                    f"        .clk(clk),",
+                    f"        .rst_n(rst_n),",
+                    f"        .valid_in({act_valid_i}),",
+                    f"        .data_in({pre_act}),",
+                    f"        .data_out({post_act}),",
+                    f"        .valid_out({act_valid_o})",
+                    f"    );",
+                    "",
+                ])
+            elif layer_act in ("Tanh", "HardSigmoid"):
+                LOGGER.warning(f"Activation '{layer_act}' for {fc.name} not implemented in RTL; using Relu.")
+                layer_act = "Relu"
+                instantiations.extend([
+                    f"    relu_layer u_relu_{i+1} (",
+                    f"        .clk(clk),",
+                    f"        .rst_n(rst_n),",
+                    f"        .valid_in({act_valid_i}),",
+                    f"        .data_in({pre_act}),",
+                    f"        .data_out({post_act}),",
+                    f"        .valid_out({act_valid_o})",
+                    f"    );",
+                    "",
+                ])
+            else:
+                instantiations.extend([
+                    f"    relu_layer u_relu_{i+1} (",
+                    f"        .clk(clk),",
+                    f"        .rst_n(rst_n),",
+                    f"        .valid_in({act_valid_i}),",
+                    f"        .data_in({pre_act}),",
+                    f"        .data_out({post_act}),",
+                    f"        .valid_out({act_valid_o})",
+                    f"    );",
+                    "",
+                ])
+            stream_valid = act_valid_o
+            stream_data = post_act
+        else:
+            # Final activation (from ONNX per-layer or final_activation or default Sigmoid)
+            use_sigmoid = layer_act in (None, "Sigmoid")
+            use_relu = layer_act == "Relu"
+            if layer_act not in (None, "Sigmoid", "Relu") and layer_act:
+                LOGGER.warning(
+                    f"Final activation '{layer_act}' from ONNX not supported in RTL; "
+                    "using Sigmoid (binary classifier default)."
+                )
+                use_sigmoid = True
+            if use_sigmoid:
+                instantiations.extend([
+                    f"    sigmoid_layer u_sigmoid (",
+                    f"        .clk(clk),",
+                    f"        .rst_n(rst_n),",
+                    f"        .valid_in({act_valid_i}),",
+                    f"        .data_in({pre_act}),",
+                    f"        .data_out(data_out),",
+                    f"        .valid_out(valid_out)",
+                    f"    );",
+                    "",
+                ])
+            elif use_relu:
+                instantiations.extend([
+                    f"    relu_layer u_relu_final (",
+                    f"        .clk(clk),",
+                    f"        .rst_n(rst_n),",
+                    f"        .valid_in({act_valid_i}),",
+                    f"        .data_in({pre_act}),",
+                    f"        .data_out(data_out),",
+                    f"        .valid_out(valid_out)",
+                    f"    );",
+                    "",
+                ])
+            else:
+                instantiations.extend([
+                    f"    assign data_out = {pre_act};",
+                    f"    assign valid_out = {act_valid_i};",
+                    "",
+                ])
+
+    body = f"""`timescale 1ns/1ps
+import quant_pkg::*;
+
+module {model_name}_top (
+{chr(10).join(port_decls)}
+);
+
+{chr(10).join(signal_decls)}
+
+{chr(10).join(connections)}
+
+{chr(10).join(instantiations)}
+
+endmodule
+"""
+    content = _pyramidtech_wrap(body, f"{model_name}_top.sv", f"Top-level binary classification NN (binaryclass_nn style) for {model_name}.")
+    out_path = out_dir / f"{model_name}_top.sv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content, encoding="utf-8")
+    return out_path
+
+
 def generate_top_module(
     model_name: str,
     layers: List[LayerInfo],
@@ -1998,10 +2623,23 @@ def generate_top_module(
     *,
     has_softmax: bool = False,
     use_parameterized_layers: bool = True,
+    use_binaryclass_nn_style: bool = False,
+    final_activation: Optional[str] = None,
+    python_scale: int = 256,
 ) -> Path:
-    """Generate top module with streaming control logic. has_softmax is accepted but ignored."""
+    """Generate top module with streaming control logic. has_softmax is accepted but ignored.
+    use_binaryclass_nn_style: fc_in -> fc_out -> relu (scalar) per layer, sigmoid at end.
+    final_activation: from ONNX graph (Sigmoid, Relu, etc.) or None for default.
+    python_scale: used to compute LAYER_SCALE from dimensions."""
     active_layers = [l for l in layers if l.layer_type != "flatten"]
     linear_layers = [l for l in active_layers if l.layer_type == "linear"]
+
+    if use_binaryclass_nn_style and use_parameterized_layers:
+        return _generate_top_module_binaryclass_nn_style(
+            model_name, layers, input_size, data_width, weight_width, out_dir, linear_layers,
+            final_activation=final_activation,
+            python_scale=python_scale,
+        )
 
     port_decls = [
         "    input  logic clk,",
@@ -2038,12 +2676,17 @@ def generate_top_module(
 
             if use_parameterized_layers:
                 if fc_name == "fc1":
+                    layer_scale_fc1 = compute_layer_scale(
+                        weight_width, in_features,
+                        layer.quant_params.get("weight_scale") if layer.quant_params else None,
+                        256,
+                    )
                     instantiations.extend([
                         f"    fc_in_layer #(",
                         f"        .NUM_NEURONS({num_neurons}),",
                         f"        .INPUT_SIZE({in_features}),",
                         f"        .BIAS_SCALE(0),",
-                        f"        .LAYER_SCALE(12)",
+                        f"        .LAYER_SCALE({layer_scale_fc1})",
                         f"    ) u_{fc_name}_in (",
                         f"        .clk(clk),",
                         f"        .rst_n(rst_n),",
@@ -2055,14 +2698,16 @@ def generate_top_module(
                         ""
                     ])
                 else:
+                    layer_scale_out = compute_layer_scale(weight_width, num_neurons, None, 256)
+                    bias_scale_out = compute_bias_scale(weight_width, num_neurons, 256)
                     connections.append(f"    // fc_out_layer for {fc_name}")
                     connections.append("")
                     instantiations.extend([
                         f"    fc_out_layer #(",
                         f"        .NUM_NEURONS({in_features}),",
                         f"        .ROM_DEPTH({num_neurons}),",
-                        f"        .LAYER_SCALE(5),",
-                        f"        .BIAS_SCALE(1)",
+                        f"        .LAYER_SCALE({layer_scale_out}),",
+                        f"        .BIAS_SCALE({bias_scale_out})",
                         f"    ) u_{fc_name}_out (",
                         f"        .clk(clk),",
                         f"        .rst_n(rst_n),",
@@ -2709,7 +3354,9 @@ def generate_mapping_report(
     data_width: int,
     weight_width: int,
     acc_width: int,
-    frac_bits: int
+    frac_bits: int,
+    *,
+    final_activation: Optional[str] = None,
 ) -> Path:
     """Generate mapping_report.txt."""
     lines = []
@@ -2722,7 +3369,40 @@ def generate_mapping_report(
     lines.append(f"Weight Width: {weight_width}")
     lines.append(f"Accumulator Width: {acc_width}")
     lines.append(f"Fractional Bits: {frac_bits}")
+    if final_activation:
+        lines.append(f"Final Activation (from ONNX): {final_activation}")
     lines.append("")
+    # Add computed LAYER_SCALE and BIAS_SCALE
+    linear_layers = [l for l in layers if l.layer_type == "linear"]
+    if len(linear_layers) in (3, 6):
+        try:
+            scales = compute_layer_scales_for_binaryclass(linear_layers, weight_width, scale)
+            lines.append("Computed LAYER_SCALE (from dimensions + ONNX quant params):")
+            for k in ["FC_1_IN_LAYER_SCALE", "FC_1_OUT_LAYER_SCALE", "FC_2_IN_LAYER_SCALE", "FC_2_OUT_LAYER_SCALE", "FC_3_IN_LAYER_SCALE", "FC_3_OUT_LAYER_SCALE"]:
+                if k in scales:
+                    lines.append(f"  {k}: {scales[k]}")
+            lines.append("Computed BIAS_SCALE (from accumulator/bias alignment):")
+            for k in ["FC_1_IN_BIAS_SCALE", "FC_1_OUT_BIAS_SCALE", "FC_2_IN_BIAS_SCALE", "FC_2_OUT_BIAS_SCALE", "FC_3_IN_BIAS_SCALE", "FC_3_OUT_BIAS_SCALE"]:
+                if k in scales:
+                    lines.append(f"  {k}: {scales[k]}")
+            lines.append("")
+        except Exception:
+            pass
+    elif linear_layers:
+        try:
+            per_layer = compute_layer_scales_for_hierarchical(linear_layers, weight_width, scale)
+            lines.append("Computed LAYER_SCALE and BIAS_SCALE (per layer, hierarchical):")
+            for s in per_layer:
+                lines.append(f"  {s['layer']}: LAYER_SCALE in={s['in_layer_scale']} out={s['out_layer_scale']}, BIAS_SCALE in={s['in_bias_scale']} out={s['out_bias_scale']}")
+            lines.append("")
+        except Exception:
+            pass
+    # Per-layer activation (from ONNX graph trace)
+    for layer in linear_layers:
+        if layer.activation:
+            lines.append(f"  {layer.name} activation: {layer.activation}")
+    if any(l.activation for l in linear_layers):
+        lines.append("")
     lines.append("Layer Mapping:")
     lines.append("-" * 80)
 
@@ -2743,6 +3423,10 @@ def generate_mapping_report(
             lines.append(line)
         lines.append("")
 
+    if final_activation:
+        lines.append(f"  {len(layers) + 1:2d}. {(final_activation + '_final'):20s} {'activation':10s} (from ONNX graph)")
+        lines.append("")
+
     lines.append("Generated Files:")
     lines.append("-" * 80)
     for layer in layers:
@@ -2758,12 +3442,15 @@ def generate_mapping_report(
 def generate_netlist_json(
     out_dir: Path,
     model_name: str,
-    layers: List[LayerInfo]
+    layers: List[LayerInfo],
+    *,
+    final_activation: Optional[str] = None,
 ) -> Path:
     """Generate netlist.json."""
     netlist = {
         "model_name": model_name,
-        "layers": []
+        "layers": [],
+        "final_activation": final_activation,
     }
 
     for layer in layers:
@@ -2784,8 +3471,270 @@ def generate_netlist_json(
 
 
 # -----------------------------------------------------------------------------
-# Binaryclass_nn Format (AXI4-Stream, binaryclass_NN module name, reference structure)
+# Layer Scale Computation (from ONNX quant params and/or dimensions)
 # -----------------------------------------------------------------------------
+#
+# LAYER_SCALE: Right-shift on accumulator output to normalize sum-of-products
+#   into output fractional scale. Depends on input_size (sum bit growth) and
+#   optionally ONNX weight_scale (quantized weight scale).
+#
+# BIAS_SCALE: Left-shift on bias before adding to accumulator. Aligns bias
+#   (stored in output scale) with accumulator (product scale + sum growth).
+#
+
+def compute_layer_scale(
+    weight_width: int,
+    input_size: int,
+    weight_scale: Optional[float] = None,
+    python_scale: int = 256,
+) -> int:
+   
+    # Output fractional bits from global python_scale (e.g. 256 -> 8 bits)
+    output_frac_bits = int(round(math.log2(python_scale))) if python_scale > 0 else 8
+    # Bit growth from summing input_size products
+    log2_n = max(0, math.ceil(math.log2(input_size)) if input_size > 0 else 0)
+    if weight_scale is not None and weight_scale > 0:
+        # ONNX weight_scale: product has scale weight_scale, so -log2(scale) fractional bits
+        effective_weight_frac = max(0, math.ceil(-math.log2(weight_scale)))
+        # Use the larger of output scale vs ONNX scale (avoid under-shifting)
+        frac_bits = max(output_frac_bits, effective_weight_frac)
+        shift = frac_bits + log2_n
+    else:
+        # No ONNX scale: use python_scale fractional bits only
+        shift = output_frac_bits + log2_n
+    return max(0, min(int(shift), 24))
+
+
+def compute_bias_scale(
+    weight_width: int,
+    input_size: int,
+    python_scale: int = 256,
+    bias_scale_from_onnx: Optional[float] = None,
+) -> int:
+
+    # Bias is stored with python_scale fractional bits
+    output_frac_bits = int(round(math.log2(python_scale))) if python_scale > 0 else 8
+    log2_n = max(0, math.ceil(math.log2(input_size)) if input_size > 0 else 0)
+    # Accumulator: product has 2*weight_width frac bits; sum adds log2(input_size) growth
+    acc_frac = 2 * weight_width + log2_n
+    bias_frac = output_frac_bits
+    # Left-shift bias by (acc_frac - bias_frac) to align with accumulator
+    scale = max(0, acc_frac - bias_frac)
+    return min(scale, 16)
+
+
+def compute_layer_scales_for_binaryclass(
+    linear_layers: List[LayerInfo],
+    weight_width: int,
+    python_scale: int = 256,
+) -> Dict[str, int]:
+    """Compute LAYER_SCALE and BIAS_SCALE for each binaryclass block (3 or 6 layers -> 3 blocks).
+
+    Block structure (6layer case):
+      Block 1: fc1 (IN) + fc2 (OUT)  -> FC_1_IN_*, FC_1_OUT_*
+      Block 2: fc3 (IN) + fc4 (OUT)  -> FC_2_IN_*, FC_2_OUT_*
+      Block 3: fc5 (IN) + fc6 (OUT)  -> FC_3_IN_*, FC_3_OUT_*
+
+    IN layers (fc_proj_in): use ONNX weight_scale when available (MatMulInteger path)
+    OUT layers (fc_proj_out): typically no weight_scale in ONNX; use python_scale only"""
+    if len(linear_layers) == 3:
+        fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
+        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
+        fc2_in, fc2_out = fc2.in_features or 0, fc2.out_features or 0
+        fc3_in, fc3_out = fc3.in_features or 0, fc3.out_features or 0
+        fc1_rom = fc2.out_features or 0
+        fc2_rom = fc3.out_features or 0
+        fc3_rom = 1
+    elif len(linear_layers) == 6:
+        fc1, fc3, fc5 = linear_layers[0], linear_layers[2], linear_layers[4]
+        fc2, fc4, fc6 = linear_layers[1], linear_layers[3], linear_layers[5]
+        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
+        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0
+        fc3_in, fc3_out = fc5.in_features or 0, fc5.out_features or 0
+        fc1_rom = fc2.out_features or 0
+        fc2_rom = fc4.out_features or 0
+        fc3_rom = fc6.out_features or 1
+    else:
+        raise RuntimeError(f"binaryclass_nn requires 3 or 6 FC layers; found {len(linear_layers)}")
+
+    # Get weight_scale from ONNX quant_params (MatMulInteger, QLinearMatMul) for IN layers
+    def _ws(layer: LayerInfo) -> Optional[float]:
+        if layer.quant_params and "weight_scale" in layer.quant_params:
+            return layer.quant_params["weight_scale"]
+        if layer.quant_params and "b_scale" in layer.quant_params:
+            return layer.quant_params["b_scale"]
+        return None
+    w1 = _ws(fc1)
+    w2 = _ws(fc3) if len(linear_layers) >= 4 else _ws(fc2)
+    w3 = _ws(fc5) if len(linear_layers) == 6 else _ws(fc3)
+
+    return {
+        # Block 1: IN uses weight_scale from fc1; OUT uses fc2 output dim (fc1_rom)
+        "FC_1_IN_LAYER_SCALE": compute_layer_scale(weight_width, fc1_in, w1, python_scale),
+        "FC_1_IN_BIAS_SCALE": compute_bias_scale(weight_width, fc1_in, python_scale),
+        "FC_1_OUT_LAYER_SCALE": compute_layer_scale(weight_width, fc1_rom, None, python_scale),
+        "FC_1_OUT_BIAS_SCALE": compute_bias_scale(weight_width, fc1_rom, python_scale),
+        # Block 2: IN uses weight_scale from fc3; OUT uses fc4 output dim (fc2_rom)
+        "FC_2_IN_LAYER_SCALE": compute_layer_scale(weight_width, fc2_in, w2, python_scale),
+        "FC_2_IN_BIAS_SCALE": compute_bias_scale(weight_width, fc2_in, python_scale),
+        "FC_2_OUT_LAYER_SCALE": compute_layer_scale(weight_width, fc2_rom, None, python_scale),
+        "FC_2_OUT_BIAS_SCALE": compute_bias_scale(weight_width, fc2_rom, python_scale),
+        # Block 3: IN uses weight_scale from fc5; OUT uses fc6 output dim (fc3_rom, usually 1)
+        "FC_3_IN_LAYER_SCALE": compute_layer_scale(weight_width, fc3_in, w3, python_scale),
+        "FC_3_IN_BIAS_SCALE": compute_bias_scale(weight_width, fc3_in, python_scale),
+        "FC_3_OUT_LAYER_SCALE": compute_layer_scale(weight_width, fc3_rom, None, python_scale),
+        "FC_3_OUT_BIAS_SCALE": compute_bias_scale(weight_width, fc3_rom, python_scale),
+    }
+
+
+def compute_layer_scales_for_hierarchical(
+    linear_layers: List[LayerInfo],
+    weight_width: int,
+    python_scale: int = 256,
+) -> List[Dict[str, int]]:
+    """Compute LAYER_SCALE and BIAS_SCALE per FC layer for hierarchical format (any N layers).
+    Returns list of dicts: [{"layer": name, "in_layer_scale", "in_bias_scale", "out_layer_scale", "out_bias_scale"}, ...]
+    Each layer has fc_in (input_size=in_features) and fc_out (rom_depth=next_layer.in_features or 1)."""
+    result: List[Dict[str, int]] = []
+    for idx, layer in enumerate(linear_layers):
+        in_f = layer.in_features or 0
+        next_in = (
+            linear_layers[idx + 1].in_features or 1
+            if idx + 1 < len(linear_layers)
+            else 1
+        )
+        ws = None
+        if layer.quant_params and "weight_scale" in layer.quant_params:
+            ws = layer.quant_params["weight_scale"]
+        elif layer.quant_params and "b_scale" in layer.quant_params:
+            ws = layer.quant_params["b_scale"]
+        result.append({
+            "layer": layer.name,
+            "in_layer_scale": compute_layer_scale(weight_width, in_f, ws, python_scale),
+            "in_bias_scale": compute_bias_scale(weight_width, in_f, python_scale),
+            "out_layer_scale": compute_layer_scale(weight_width, next_in, None, python_scale),
+            "out_bias_scale": compute_bias_scale(weight_width, next_in, python_scale),
+        })
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Binaryclass_nn Format
+# -----------------------------------------------------------------------------
+
+def _compute_binaryclass_nn_params(linear_layers: List[LayerInfo], weight_width: int = 8, python_scale: int = 256) -> dict:
+    """Compute binaryclass_NN parameters from ONNX layers.
+    Supports 3 layers (fc1,fc2,fc3) or 6 layers (fc1..fc6) paired into 3 blocks.
+    Block 1: fc_proj_in (fc1) + fc_proj_out (fc2); Block 2: fc_2_proj_in (fc3) + fc_2_proj_out (fc4);
+    Block 3: fc_3_proj_in (fc5) + fc_3_proj_out (fc6). For 3 layers: fc4,fc5,fc6 are derived.
+    LAYER_SCALE and BIAS_SCALE are computed from dimensions and ONNX quant params."""
+    if len(linear_layers) == 3:
+        fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
+        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
+        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0  # block 2 = fc3
+        fc3_in, fc3_out = fc3.out_features or 1, 1  # block 3: receives fc3 output (1 value)
+        fc1_rom = fc2.out_features or 0
+        fc2_rom = fc3.out_features or 0
+        fc3_rom = 1
+    elif len(linear_layers) == 6:
+        fc1, fc3, fc5 = linear_layers[0], linear_layers[2], linear_layers[4]
+        fc2, fc4, fc6 = linear_layers[1], linear_layers[3], linear_layers[5]
+        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
+        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0
+        fc3_in, fc3_out = fc5.in_features or 0, fc5.out_features or 0
+        fc1_rom = fc2.out_features or 0
+        fc2_rom = fc4.out_features or 0
+        fc3_rom = fc6.out_features or 1
+    else:
+        raise RuntimeError(
+            f"binaryclass_nn format requires 3 or 6 FC layers; found {len(linear_layers)}."
+        )
+    scales = compute_layer_scales_for_binaryclass(linear_layers, weight_width, python_scale)
+    return {
+        "FC_1_NEURONS": fc1_out,
+        "FC_2_NEURONS": fc2_out,
+        "FC_3_NEURONS": fc3_out,
+        "FC_1_INPUT_SIZE": fc1_in,
+        "FC_2_INPUT_SIZE": fc2_in,
+        "FC_3_INPUT_SIZE": fc3_in,
+        "FC_1_ROM_DEPTH": fc1_rom,
+        "FC_2_ROM_DEPTH": fc2_rom,
+        "FC_3_ROM_DEPTH": fc3_rom,
+        "FC_1_IN_LAYER_SCALE": scales["FC_1_IN_LAYER_SCALE"],
+        "FC_1_IN_BIAS_SCALE": scales["FC_1_IN_BIAS_SCALE"],
+        "FC_1_OUT_LAYER_SCALE": scales["FC_1_OUT_LAYER_SCALE"],
+        "FC_1_OUT_BIAS_SCALE": scales["FC_1_OUT_BIAS_SCALE"],
+        "FC_2_IN_LAYER_SCALE": scales["FC_2_IN_LAYER_SCALE"],
+        "FC_2_IN_BIAS_SCALE": scales["FC_2_IN_BIAS_SCALE"],
+        "FC_2_OUT_LAYER_SCALE": scales["FC_2_OUT_LAYER_SCALE"],
+        "FC_2_OUT_BIAS_SCALE": scales["FC_2_OUT_BIAS_SCALE"],
+        "FC_3_IN_LAYER_SCALE": scales["FC_3_IN_LAYER_SCALE"],
+        "FC_3_IN_BIAS_SCALE": scales["FC_3_IN_BIAS_SCALE"],
+        "FC_3_OUT_LAYER_SCALE": scales["FC_3_OUT_LAYER_SCALE"],
+        "FC_3_OUT_BIAS_SCALE": scales["FC_3_OUT_BIAS_SCALE"],
+        "FIFO_DEPTH": 1024,
+    }
+
+
+def generate_binaryclass_NN_top_from_template(
+    out_dir: Path,
+    linear_layers: List[LayerInfo],
+    weight_width: int = 8,
+    python_scale: int = 256,
+) -> Path:
+    """Generate binaryclass_NN.sv from embedded template, substituting parameters from ONNX layers."""
+    content = BINARYCLASS_NN_SV
+
+    params = _compute_binaryclass_nn_params(linear_layers, weight_width, python_scale)
+    for param_name, value in params.items():
+        content = re.sub(
+            rf"(parameter int {re.escape(param_name)}\s*=\s*)32'd\d+",
+            rf"\g<1>32'd{value}",
+            content,
+        )
+
+    out_path = out_dir / "binaryclass_NN.sv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    LOGGER.info(f"  Generated binaryclass_NN.sv from template (params from ONNX)")
+    return out_path
+
+
+def generate_binaryclass_NN_wrapper_from_template(
+    out_dir: Path,
+    linear_layers: List[LayerInfo],
+    weight_width: int = 8,
+    python_scale: int = 256,
+) -> Path:
+    """Generate binaryclass_NN_wrapper.sv from embedded template, substituting parameters."""
+    content = BINARYCLASS_NN_WRAPPER_SV
+
+    params = _compute_binaryclass_nn_params(linear_layers, weight_width, python_scale)
+    # Map wrapper param names (FC1_NEURONS) to template substitution
+    wrapper_params = {
+        "FC1_NEURONS": params["FC_1_NEURONS"],
+        "FC2_NEURONS": params["FC_2_NEURONS"],
+        "FC3_NEURONS": params["FC_3_NEURONS"],
+        "FC1_INPUT_SIZE": params["FC_1_INPUT_SIZE"],
+        "FC2_INPUT_SIZE": params["FC_2_INPUT_SIZE"],
+        "FC3_INPUT_SIZE": params["FC_3_INPUT_SIZE"],
+        "FC1_ROM_DEPTH": params["FC_1_ROM_DEPTH"],
+        "FC2_ROM_DEPTH": params["FC_2_ROM_DEPTH"],
+        "FC3_ROM_DEPTH": params["FC_3_ROM_DEPTH"],
+    }
+    for param_name, value in wrapper_params.items():
+        content = re.sub(
+            rf"(parameter int {re.escape(param_name)}\s*=\s*)\d+",
+            rf"\g<1>{value}",
+            content,
+        )
+
+    out_path = out_dir / "binaryclass_NN_wrapper.sv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    LOGGER.info(f"  Generated binaryclass_NN_wrapper.sv from template")
+    return out_path
+
 
 def emit_binaryclass_nn_format(
     out_dir: Path,
@@ -2795,90 +3744,91 @@ def emit_binaryclass_nn_format(
     scale: int,
 ) -> None:
     """Emit RTL in binaryclass_nn format: binaryclass_NN module, AXI4-Stream ports, reference structure.
-    Requires exactly 3 FC layers (fc1, fc2, fc3)."""
+    Requires 3 FC layers (fc1, fc2, fc3) or 6 FC layers (fc1..fc6) paired into 3 blocks."""
     linear_layers = [l for l in layers if l.layer_type == "linear"]
-    if len(linear_layers) != 3:
+    if len(linear_layers) not in (3, 6):
         raise RuntimeError(
-            f"binaryclass_nn format requires exactly 3 FC layers; found {len(linear_layers)}. "
+            f"binaryclass_nn format requires 3 or 6 FC layers; found {len(linear_layers)}. "
             "Use hierarchical or flattened format for other topologies."
         )
+    expected_names = [f"fc{i + 1}" for i in range(len(linear_layers))]
     for i, fc in enumerate(linear_layers):
-        if fc.name != f"fc{i + 1}":
-            raise RuntimeError(f"binaryclass_nn format expects fc1, fc2, fc3; got {fc.name}")
+        if fc.name != expected_names[i]:
+            raise RuntimeError(
+                f"binaryclass_nn format expects {expected_names}; got {fc.name} at index {i}"
+            )
 
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    mem_dir = out_dir / "mem_files"
-    mem_dir.mkdir(parents=True, exist_ok=True)
+    # binaryclass_nn layout: .mem in out_dir root (alongside .sv)
+    mem_dir = out_dir
 
-    # Layer dimensions
-    fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
-    fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-    fc2_in, fc2_out = fc2.in_features or 0, fc2.out_features or 0
-    fc3_in, fc3_out = fc3.in_features or 0, fc3.out_features or 0
-    fc1_rom_depth = fc2_in  # FC1_ROM_DEPTH = FC2_INPUT_SIZE
-    fc2_rom_depth = fc3_in  # FC2_ROM_DEPTH = FC3_INPUT_SIZE
-    fc3_rom_depth = 1
+    # Layer dimensions (3 or 6 layers → 3 blocks)
+    if len(linear_layers) == 6:
+        fc1, fc2, fc3 = linear_layers[0], linear_layers[2], linear_layers[4]
+        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
+        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0
+        fc3_in, fc3_out = linear_layers[4].in_features or 0, linear_layers[4].out_features or 0
+        fc1_rom_depth = linear_layers[1].out_features or 0
+        fc2_rom_depth = linear_layers[3].out_features or 0
+        fc3_rom_depth = linear_layers[5].out_features or 1
+    else:
+        fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
+        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
+        fc2_in, fc2_out = fc2.in_features or 0, fc2.out_features or 0
+        fc3_in, fc3_out = fc3.in_features or 0, fc3.out_features or 0
+        fc1_rom_depth = fc2_out
+        fc2_rom_depth = fc3_out
+        fc3_rom_depth = 1
 
-    # 1. Write embedded binaryclass_nn modules
-    (out_dir / "quant_pkg.sv").write_text(
-        f"`define Q_INT{weight_width}\n" + BINARYCLASS_QUANT_PKG_SV, encoding="utf-8"
+    # 1. Write reusable templates from binaryclass_nn/ (headers stripped) or embedded fallback
+    (out_dir / "quant_pkg.sv").write_text(_get_quant_pkg_from_template(weight_width), encoding="utf-8")
+    _write_template_or_embedded(out_dir, "mac.sv", _load_reusable_template("mac.sv"), BINARYCLASS_MAC_SV)
+    _write_template_or_embedded(out_dir, "fc_in.sv", _load_reusable_template("fc_in.sv"), BINARYCLASS_FC_IN_SV)
+    _write_template_or_embedded(out_dir, "fc_out.sv", _load_reusable_template("fc_out.sv"), BINARYCLASS_FC_OUT_SV)
+    _write_template_or_embedded(out_dir, "relu_layer.sv", _load_reusable_template("relu_layer.sv"), BINARYCLASS_RELU_LAYER_SV)
+    _write_template_or_embedded(out_dir, "sigmoid_layer.sv", _load_reusable_template("sigmoid_layer.sv"), BINARYCLASS_SIGMOID_LAYER_SV)
+    _write_template_or_embedded(out_dir, "sync_fifo.sv", _load_reusable_template("sync_fifo.sv"), BINARYCLASS_SYNC_FIFO_SV)
+    LOGGER.info("  Wrote reusable templates from binaryclass_nn (quant_pkg, mac, fc_in, fc_out, relu_layer, sigmoid_layer, sync_fifo)")
+
+    # 2. Generate .mem files with binaryclass_nn naming (proj_in + proj_out per layer block)
+    # 3 layers: fc_proj_in=fc1, fc_proj_out=fc2; fc_2_proj_in=fc2, fc_2_proj_out=fc3; fc_3_proj_in=fc3, fc_3_proj_out=1x1
+    # 6 layers: fc_proj_in=fc1, fc_proj_out=fc2; fc_2_proj_in=fc3, fc_2_proj_out=fc4; fc_3_proj_in=fc5, fc_3_proj_out=fc6
+    generate_proj_mem_files(
+        layers, mem_dir, scale, weight_width,
+        six_layer_blocks=(len(linear_layers) == 6),
     )
-    (out_dir / "mac.sv").write_text(BINARYCLASS_MAC_SV, encoding="utf-8")
-    (out_dir / "fc_in.sv").write_text(BINARYCLASS_FC_IN_SV, encoding="utf-8")
-    (out_dir / "fc_out.sv").write_text(BINARYCLASS_FC_OUT_SV, encoding="utf-8")
-    (out_dir / "relu_layer.sv").write_text(BINARYCLASS_RELU_LAYER_SV, encoding="utf-8")
-    (out_dir / "sigmoid_layer.sv").write_text(BINARYCLASS_SIGMOID_LAYER_SV, encoding="utf-8")
-    LOGGER.info("  Wrote binaryclass_nn modules (quant_pkg, mac, fc_in, fc_out, relu_layer, sigmoid_layer)")
 
-    # 2. Generate .mem files with binaryclass_nn naming
-    # fc_proj_in: fc1 weights (in_f x out_f), fc_proj_out: fc1->fc2 weights (fc2_in x fc1_out)
-    # fc_2_proj_in: fc2 weights, fc_2_proj_out: fc2->fc3 weights
-    # fc_3_proj_in: fc3 weights, fc_3_proj_out: fc3 output (1x1)
-    for layer, (proj_name, in_f, out_f, next_out) in zip(linear_layers, [
-        ("fc_proj", fc1_in, fc1_out, fc2_in),
-        ("fc_2_proj", fc2_in, fc2_out, fc3_in),
-        ("fc_3_proj", fc3_in, fc3_out, 1),
-    ]):
-        w_np = layer.weight.detach().cpu().numpy().astype(np.float32)
-        b_np = layer.bias.detach().cpu().numpy().astype(np.float32) if layer.bias is not None else np.zeros((out_f,), dtype=np.float32)
-        wq = float_to_int(w_np, scale, weight_width)
-        bq = float_to_int(b_np, scale, weight_width)
-        # fc_X_proj_in: weights in_f x out_f
-        generate_quant_pkg_style_weight_mem(wq, mem_dir / f"{proj_name}_in_weights.mem", layer.name, in_f, out_f, weight_width)
-        generate_quant_pkg_style_bias_mem(bq, mem_dir / f"{proj_name}_in_biases.mem", out_f, weight_width)
-        # fc_X_proj_out: weights next_out x out_f (ROM has next_out rows, each row = out_f weights)
-        # fc_X_proj_out: ROM has next_out rows, each row has out_f weights. Matrix next_out x out_f.
-        # For fc1_out: fc2_in x fc1_out. Our fc2 has in=fc2_in, out=fc2_out. The fc1_out projects fc1->fc2.
-        # We need weights (next_out, out_f). Use identity-like when next_out==out_f, else zeros.
-        if next_out == out_f:
-            w_out = np.eye(next_out, out_f, dtype=np.float32) * (scale / 256.0)
-            w_out = float_to_int(w_out, scale, weight_width)
-        else:
-            w_out = float_to_int(np.zeros((next_out, out_f), dtype=np.float32), scale, weight_width)
-        generate_quant_pkg_style_weight_mem(w_out, mem_dir / f"{proj_name}_out_weights.mem", layer.name, out_f, next_out, weight_width)
-        bq_out = bq if next_out == 1 else float_to_int(np.zeros((next_out,), dtype=np.float32), scale, weight_width)
-        generate_quant_pkg_style_bias_mem(bq_out, mem_dir / f"{proj_name}_out_biases.mem", next_out, weight_width)
-
-    # 3. Generate ROMs with binaryclass_nn naming
-    for layer, (proj_name, in_f, out_f, next_out) in zip(linear_layers, [
-        ("fc_proj", fc1_in, fc1_out, fc2_in),
-        ("fc_2_proj", fc2_in, fc2_out, fc3_in),
-        ("fc_3_proj", fc3_in, fc3_out, 1),
-    ]):
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_in", in_f, out_f, weight_width, mem_dir, "weights")
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_in_bias", 1, out_f, weight_width, mem_dir, "biases")
-        rom_d = fc2_in if proj_name == "fc_proj" else fc3_in if proj_name == "fc_2_proj" else 1
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_out", rom_d, out_f, weight_width, mem_dir, "weights")
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_out_bias", rom_d, 1, weight_width, mem_dir, "biases")
+    # 3. Generate ROMs with binaryclass_nn naming (3 blocks: fc_proj, fc_2_proj, fc_3_proj)
+    # proj_in: (in_f, out_f); proj_out: (rom_d, proj_out_f) where proj_out_f = next block's output size
+    proj1_out_f = linear_layers[1].out_features or 0
+    proj2_out_f = (linear_layers[3].out_features if len(linear_layers) > 3 else linear_layers[2].out_features) or 1
+    for proj_name, in_f, out_f, rom_d, proj_out_f in [
+        ("fc_proj", fc1_in, fc1_out, fc1_rom_depth, proj1_out_f),
+        ("fc_2_proj", fc2_in, fc2_out, fc2_rom_depth, proj2_out_f),
+        ("fc_3_proj", fc3_in, fc3_out, fc3_rom_depth, 1),
+    ]:
+        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_in_weights_rom", in_f, out_f, weight_width, mem_dir, "weights")
+        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_in_bias_rom", 1, out_f, weight_width, mem_dir, "biases")
+        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_out_weights_rom", rom_d, proj_out_f, weight_width, mem_dir, "weights")
+        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_out_bias_rom", rom_d, 1, weight_width, mem_dir, "biases")
 
     # 4. Generate fc_in_layer and fc_out_layer (with generate blocks for our sizes)
-    _generate_fc_in_layer_binaryclass(out_dir, fc1_in, fc2_in, fc3_in, weight_width, mem_dir)
+    # Use FC_*_INPUT_SIZE from params (same as binaryclass_NN top) so ROM selection matches
+    params = _compute_binaryclass_nn_params(linear_layers, weight_width, scale)
+    _generate_fc_in_layer_binaryclass(
+        out_dir,
+        params["FC_1_INPUT_SIZE"],
+        params["FC_2_INPUT_SIZE"],
+        params["FC_3_INPUT_SIZE"],
+        weight_width,
+        mem_dir,
+    )
     _generate_fc_out_layer_binaryclass(out_dir, fc1_rom_depth, fc2_rom_depth, fc3_rom_depth, weight_width, mem_dir)
 
-    # 5. Generate binaryclass_NN and binaryclass_NN_wrapper
-    _generate_binaryclass_NN(out_dir, fc1_out, fc2_out, fc3_out, fc1_in, fc2_in, fc3_in, fc1_rom_depth, fc2_rom_depth, fc3_rom_depth)
-    _generate_binaryclass_NN_wrapper(out_dir, fc1_out, fc2_out, fc3_out, fc1_in, fc2_in, fc3_in, fc1_rom_depth, fc2_rom_depth, fc3_rom_depth)
+    # 5. Generate binaryclass_NN from template (line-by-line match) and wrapper from template
+    generate_binaryclass_NN_top_from_template(out_dir, linear_layers, weight_width, scale)
+    generate_binaryclass_NN_wrapper_from_template(out_dir, linear_layers, weight_width, scale)
 
 
 def _generate_binaryclass_nn_rom(
@@ -2889,12 +3839,16 @@ def _generate_binaryclass_nn_rom(
     weight_width: int,
     mem_dir: Path,
     mem_type: str,
+    *,
+    mem_path_prefix: str = "",
 ) -> None:
-    """Generate a ROM module with binaryclass_nn naming."""
-    base = rom_name.replace("_bias", "")
-    mem_file = f"mem_files/{base}_{mem_type}.mem"
+    """Generate a ROM module with binaryclass_nn naming. mem_path_prefix: '' for root layout.
+    rom_name must be e.g. fc_proj_in_weights_rom or fc_proj_in_bias_rom (matches fc_in_layer/fc_out_layer)."""
+    base = rom_name.replace("_weights_rom", "").replace("_bias_rom", "")
     if "bias" in rom_name:
-        mem_file = mem_file.replace("_weights", "_biases")
+        mem_file = f"{mem_path_prefix}{base}_bias.mem"
+    else:
+        mem_file = f"{mem_path_prefix}{base}_weights.mem"
     packed_width = width_neurons * weight_width
     if "bias" in rom_name and "in" in rom_name:
         packed_width = width_neurons * weight_width * 4  # acc_t per neuron for fc_in bias
@@ -2930,7 +3884,7 @@ endmodule : {rom_name}
 
 
 def _generate_fc_in_layer_binaryclass(out_dir: Path, l1_in: int, l2_in: int, l3_in: int, weight_width: int, mem_dir: Path) -> None:
-    """Generate fc_in_layer with generate blocks for model sizes."""
+    """Generate fc_in_layer with generate blocks for model sizes. Uses l1_in, l2_in, l3_in for distinct ROM selection (fixes duplicate INPUT_SIZE==5 bug)."""
     body = f"""`timescale 1ns/1ps
 import quant_pkg::*;
 
@@ -2940,13 +3894,13 @@ module fc_in_layer #(
     parameter signed LAYER_SCALE = 12,
     parameter signed BIAS_SCALE  = 0
 )(
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-    input  q_data_t data_in,
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic valid_i,
+    input  q_data_t data_i,
 
-    output q_data_t data_out[NUM_NEURONS],
-    output logic valid_out
+    output q_data_t data_o[NUM_NEURONS],
+    output logic valid_o
 );
 
     logic [$clog2(INPUT_SIZE)-1:0] weight_addr;
@@ -2954,23 +3908,23 @@ module fc_in_layer #(
     logic [NUM_NEURONS*Q_WIDTH*4-1:0] bias_rom_row;
     q_data_t weights_rom_data[NUM_NEURONS];
     acc_t bias_rom_data[NUM_NEURONS];
-    logic valid_in_reg;
-    q_data_t data_in_reg;
+    logic valid_i_q;
+    q_data_t data_i_q;
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            valid_in_reg <= 1'b0;
-            data_in_reg   <= '0;
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
+            valid_i_q <= 1'b0;
+            data_i_q  <= '0;
         end else begin
-            valid_in_reg <= valid_in;
-            data_in_reg   <= data_in;
+            valid_i_q <= valid_i;
+            data_i_q  <= data_i;
         end
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i)
             weight_addr <= '0;
-        else if (valid_in)
+        else if (valid_i)
             weight_addr <= (weight_addr == INPUT_SIZE-1) ? '0 : weight_addr + 1'b1;
     end
 
@@ -2978,19 +3932,19 @@ module fc_in_layer #(
     generate
         if (INPUT_SIZE == {l1_in}) begin
             fc_proj_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk), .addr_i(weight_addr), .data_o(weight_rom_row));
+                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
             fc_proj_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk), .addr_i(1'b0), .data_o(bias_rom_row));
+                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
         end else if (INPUT_SIZE == {l2_in}) begin
             fc_2_proj_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk), .addr_i(weight_addr), .data_o(weight_rom_row));
+                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
             fc_2_proj_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk), .addr_i(1'b0), .data_o(bias_rom_row));
+                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
         end else if (INPUT_SIZE == {l3_in}) begin
             fc_3_proj_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk), .addr_i(weight_addr), .data_o(weight_rom_row));
+                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
             fc_3_proj_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk), .addr_i(1'b0), .data_o(bias_rom_row));
+                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
         end
     endgenerate
 
@@ -3007,14 +3961,14 @@ module fc_in_layer #(
         .LAYER_SCALE(LAYER_SCALE),
         .BIAS_SCALE(BIAS_SCALE)
     ) u_fc_in (
-        .clk(clk),
-        .rst_n(rst_n),
-        .valid_in(valid_in_reg),
-        .data_in(data_in_reg),
-        .weights(weights_rom_data),
-        .biases(bias_rom_data),
-        .data_out(data_out),
-        .valid_out(valid_out)
+        .clk_i(clk_i),
+        .rst_n_i(rst_n_i),
+        .valid_i(valid_i_q),
+        .data_i(data_i_q),
+        .weights_i(weights_rom_data),
+        .biases_i(bias_rom_data),
+        .data_o(data_o),
+        .valid_o(valid_o)
     );
 
 endmodule
@@ -3033,13 +3987,13 @@ module fc_out_layer #(
     parameter signed LAYER_SCALE = 5,
     parameter signed BIAS_SCALE  = 1
 )(
-    input  logic clk,
-    input  logic rst_n,
-    input  logic valid_in,
-    input  q_data_t data_in[NUM_NEURONS],
+    input  logic clk_i,
+    input  logic rst_n_i,
+    input  logic valid_i,
+    input  q_data_t data_i[NUM_NEURONS],
 
-    output q_data_t data_out,
-    output logic valid_out
+    output q_data_t data_o,
+    output logic valid_o
 );
 
     logic [$clog2(ROM_DEPTH)-1:0] addr_cnt;
@@ -3055,10 +4009,10 @@ module fc_out_layer #(
     acc_t bias_rom_data;
     q_data_t weights_rom_data_reg[NUM_NEURONS];
     acc_t bias_rom_data_reg;
-    q_data_t data_in_reg[NUM_NEURONS];
+    q_data_t data_i_reg[NUM_NEURONS];
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i)
             addr_cnt <= '0;
         else if (valid_pipeline)
             addr_cnt <= (addr_cnt == ROM_DEPTH-1) ? '0 : addr_cnt + 1'b1;
@@ -3066,17 +4020,17 @@ module fc_out_layer #(
 
     assign addr_last = (addr_cnt == ROM_DEPTH-1);
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i)
             valid_pipeline <= 1'b0;
-        else if (valid_in)
+        else if (valid_i)
             valid_pipeline <= 1'b1;
         else if (addr_last)
             valid_pipeline <= 1'b0;
     end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
             valid_pipeline_reg   <= 1'b0;
             valid_out_engine_reg <= 1'b0;
         end else begin
@@ -3085,26 +4039,26 @@ module fc_out_layer #(
         end
     end
 
-    assign valid_out = valid_out_engine_reg;
+    assign valid_o = valid_out_engine_reg;
     assign weights_rom_addr = addr_cnt;
     assign bias_rom_addr    = addr_cnt;
 
     generate
         if (ROM_DEPTH == {rom1}) begin
             fc_proj_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk), .addr_i(weights_rom_addr), .data_o(weights_rom_data_raw));
+                .clk_i(clk_i), .addr_i(weights_rom_addr), .data_o(weights_rom_data_raw));
             fc_proj_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk), .addr_i(bias_rom_addr), .data_o(bias_rom_data));
+                .clk_i(clk_i), .addr_i(bias_rom_addr), .data_o(bias_rom_data));
         end else if (ROM_DEPTH == {rom2}) begin
             fc_2_proj_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk), .addr_i(weights_rom_addr), .data_o(weights_rom_data_raw));
+                .clk_i(clk_i), .addr_i(weights_rom_addr), .data_o(weights_rom_data_raw));
             fc_2_proj_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk), .addr_i(bias_rom_addr), .data_o(bias_rom_data));
+                .clk_i(clk_i), .addr_i(bias_rom_addr), .data_o(bias_rom_data));
         end else if (ROM_DEPTH == {rom3}) begin
             fc_3_proj_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk), .addr_i(1'b0), .data_o(weights_rom_data_raw));
+                .clk_i(clk_i), .addr_i(1'b0), .data_o(weights_rom_data_raw));
             fc_3_proj_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk), .addr_i(1'b0), .data_o(bias_rom_data));
+                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_data));
         end
     endgenerate
 
@@ -3116,17 +4070,17 @@ module fc_out_layer #(
     endgenerate
 
     integer k;
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always_ff @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
             for (k = 0; k < NUM_NEURONS; k = k + 1) begin
                 weights_rom_data_reg[k] <= '0;
-                data_in_reg[k] <= '0;
+                data_i_reg[k] <= '0;
             end
             bias_rom_data_reg <= '0;
         end else begin
             for (k = 0; k < NUM_NEURONS; k = k + 1) begin
                 weights_rom_data_reg[k] <= weights_rom_data[k];
-                data_in_reg[k] <= data_in[k];
+                data_i_reg[k] <= data_i[k];
             end
             bias_rom_data_reg <= bias_rom_data;
         end
@@ -3137,14 +4091,14 @@ module fc_out_layer #(
         .LAYER_SCALE(LAYER_SCALE),
         .BIAS_SCALE(BIAS_SCALE)
     ) u_fc_out (
-        .clk(clk),
-        .rst_n(rst_n),
-        .valid_in(valid_pipeline_reg),
-        .data_in(data_in_reg),
-        .weights(weights_rom_data_reg),
-        .bias(bias_rom_data_reg),
-        .data_out(data_out),
-        .valid_out(valid_out_engine)
+        .clk_i(clk_i),
+        .rst_n_i(rst_n_i),
+        .valid_i(valid_pipeline_reg),
+        .data_i(data_i_reg),
+        .weights_i(weights_rom_data_reg),
+        .bias_i(bias_rom_data_reg),
+        .data_o(data_o),
+        .valid_o(valid_out_engine)
     );
 
 endmodule
@@ -3388,21 +4342,20 @@ def generate_rtl_filelist(
     incdir = f"+incdir+{root_var}/\n"
     lines = [incdir]
     if binaryclass_nn_format:
-        files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "fc_in_layer.sv", "fc_out_layer.sv", "relu_layer.sv", "sigmoid_layer.sv"]
+        files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "fc_in_layer.sv", "fc_out_layer.sv", "relu_layer.sv", "sigmoid_layer.sv", "sync_fifo.sv"]
         files.extend(["fc_proj_in_weights_rom.sv", "fc_proj_in_bias_rom.sv", "fc_proj_out_weights_rom.sv", "fc_proj_out_bias_rom.sv"])
         files.extend(["fc_2_proj_in_weights_rom.sv", "fc_2_proj_in_bias_rom.sv", "fc_2_proj_out_weights_rom.sv", "fc_2_proj_out_bias_rom.sv"])
         files.extend(["fc_3_proj_in_weights_rom.sv", "fc_3_proj_in_bias_rom.sv", "fc_3_proj_out_weights_rom.sv", "fc_3_proj_out_bias_rom.sv"])
         files.append("binaryclass_NN.sv")
         top_file = "binaryclass_NN.sv"
     elif parameterized_layers:
-        files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "relu_layer.sv", "relu_layer_array.sv", "fc_in_layer.sv", "fc_out_layer.sv"]
+        files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "relu_layer.sv", "relu_layer_array.sv", "sigmoid_layer.sv", "sync_fifo.sv", "fc_in_layer.sv", "fc_out_layer.sv"]
         for idx in range(len(linear_layers)):
             prefix = _proj_prefix(idx)
             files.append(f"{prefix}_in_weights_rom.sv")
             files.append(f"{prefix}_in_bias_rom.sv")
-            if idx + 1 < len(linear_layers):
-                files.append(f"{prefix}_out_weights_rom.sv")
-                files.append(f"{prefix}_out_bias_rom.sv")
+            files.append(f"{prefix}_out_weights_rom.sv")
+            files.append(f"{prefix}_out_bias_rom.sv")
         files.append(f"{model_name}_top.sv")
         files.append(f"{model_name}_axi4_wrapper.sv")
         top_file = f"{model_name}_axi4_wrapper.sv"

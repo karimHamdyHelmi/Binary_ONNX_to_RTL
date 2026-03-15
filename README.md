@@ -18,8 +18,14 @@ python binary_onnx_to_rtl.py --onnx-model path/to/model.onnx --out-dir ./my_ip
 # With testbench
 python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --emit-testbench
 
-# Hierarchical RTL (default): parameterized fc_in_layer, fc_out_layer, ROMs
+# Hierarchical RTL (default): supports any number of FC layers
 python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --rtl-structure hierarchical
+
+# Fixed 3-block binaryclass_NN template (only for 3 or 6 FC layers)
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --binaryclass-format
+
+# Disable binaryclass_nn style (use relu_layer_array instead of relu_layer)
+python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --no-binaryclass-nn-style
 
 # Flattened RTL structure (single inlined module)
 python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --rtl-structure flattened
@@ -32,6 +38,9 @@ python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --weight
 
 # Inspect ONNX graph structure
 python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --inspect
+
+# Print raw extracted data only (no RTL generation, --out-dir not required)
+python binary_onnx_to_rtl.py --onnx-model model.onnx --dump-extracted
 ```
 
 ## Quantization Detection
@@ -53,9 +62,10 @@ python detect_quant_type.py --checkpoint path/to/model.pth
 
 - **FC only**: Gemm, MatMul, QLinearMatMul, QLinearGemm, FusedMatMul, MatMulInteger
 - **CNN to FC**: MatMul after Reshape
+- **Any number of layers**: Hierarchical format (default) supports 1, 2, 3, 4, 5, 6, 7+ FC layers. Use `--binaryclass-format` only when you need the fixed 3-block `binaryclass_NN.sv` template (valid for 3 or 6 layers).
 
 ## Output
 
-- **RTL modules** in `--out-dir`: `quant_pkg.sv`, `fc_in_layer.sv`, `fc_out_layer.sv`, `fc_proj_in_weights_rom.sv`, `fc_proj_out_weights_rom.sv`, etc.
+- **RTL modules** in `--out-dir`: `quant_pkg.sv`, `fc_in_layer.sv`, `fc_out_layer.sv`, `relu_layer.sv`, `sigmoid_layer.sv`, `fc_proj_in_weights_rom.sv`, `fc_proj_out_weights_rom.sv`, etc.
 - **Memory files** in `--out-dir/mem_files/`: `fc_proj_in_weights.mem`, `fc_proj_in_bias.mem`, etc.
 - **Reports**: `mapping_report.txt`, `netlist.json`, `rtl_filelist.f`
