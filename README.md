@@ -6,8 +6,17 @@ Convert binary classification ONNX models (fully connected layers) to RTL and `.
 
 - **Python 3.8+**
 - **PyTorch** (for rtl_mapper)
-- **ONNX** (from `onnx_lib_path`)
-- **convert_model_to_RTL** sibling directory with `onnx_lib`
+- **ONNX** (standard pip package)
+- **NumPy** (usually installed with PyTorch)
+
+## Installation
+
+```bash
+# Create and activate a virtual environment
+python -m venv venv
+
+pip install torch onnx numpy
+```
 
 ## ONNX to RTL
 

@@ -65,26 +65,87 @@ def _load_reusable_template(filename: str) -> Optional[str]:
 
 
 def _get_quant_pkg_from_template(weight_width: int) -> str:
-    """Get quant_pkg content: use binaryclass_nn template + Q_INT define, or fallback to embedded."""
+    """Get quant_pkg content: use binaryclass_nn template or fallback to embedded (no define/ifndef preamble)."""
     template = _load_reusable_template("quant_pkg.sv")
     if template:
-        return f"`define Q_INT{weight_width}\n" + template
+        desc = "Package defining quantization widths, fixed-point data types,\n                and saturation limits for accumulation and activation functions."
+        return _pyramidtech_wrap(template, "quant_pkg.sv", desc, quant_pkg_style=True)
     return _get_quant_pkg_content(weight_width)
 
 
-def _write_template_or_embedded(sv_dir: Path, filename: str, template_content: Optional[str], embedded_content: str) -> None:
-    """Write template from binaryclass_nn (no header) if available, else embedded."""
-    content = template_content if template_content else _pyramidtech_wrap(embedded_content, filename, "")
+# Descriptions matching BinaryClass_last headers
+_FILE_DESCRIPTIONS = {
+    "mac.sv": "Pipelined Multiply-Accumulate (MAC) unit with output saturation",
+    "fc_in.sv": "Fully-connected (FC) input layer module. Instantiates MAC units, adds biases, and applies layer scaling with output saturation.",
+    "fc_out.sv": "Fully-connected (FC) output layer module with a 3-stage pipeline: Stage 1 (Multiplication), Stage 2 (Addition/Scaling), and Stage 3 (Saturation/Output).",
+    "relu_layer.sv": "ReLU activation function applied element-wise to a single input. Passes input directly if positive; outputs zero if negative.",
+    "sigmoid_layer.sv": "Sigmoid activation approximation (binary output) applied to a single input. Passes SIGMOID_MAX if input >= 0, else SIGMOID_MIN.",
+    "sync_fifo.sv": "Synchronous FIFO module for data buffering. Uses a standard pointer-based implementation with full/empty flags",
+    "relu_layer_array.sv": "ReLU activation layer (array, for legacy).",
+}
+
+
+def _write_template_or_embedded(sv_dir: Path, filename: str, template_content: Optional[str], embedded_content: str, description: str = "") -> None:
+    """Write template from binaryclass_nn or embedded; always prepend PyramidTech header."""
+    raw = template_content if template_content else embedded_content
+    desc = description or _FILE_DESCRIPTIONS.get(filename, "")
+    content = _pyramidtech_wrap(raw, filename, desc)
     (sv_dir / filename).write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+# -----------------------------------------------------------------------------
+# PyramidTech Header
+# -----------------------------------------------------------------------------
+
+def _pyramidtech_header(file_name: str, description: str, *, author: str = "Ahmed Abou-Auf", quant_pkg_style: bool = False) -> str:
+    """Generate PyramidTech proprietary header block matching BinaryClass_last format."""
+    desc_lines = description.strip().split("\n")
+    if len(desc_lines) == 1:
+        desc_block = desc_lines[0].strip()
+    else:
+        first = desc_lines[0].strip()
+        rest = "\n".join("                " + line.strip() for line in desc_lines[1:] if line.strip())
+        desc_block = first + "\n" + rest if rest else first
+    closing = "***************************************************************************************/" if quant_pkg_style else "****************************************************************************************/"
+    return f'''/****************************************************************************************
+"PYRAMIDTECH CONFIDENTIAL
+
+Copyright (c) 2026 PyramidTech LLC. All rights reserved.
+
+This file contains proprietary and confidential information of PyramidTech LLC.
+The information contained herein is unpublished and subject to trade secret
+protection. No part of this file may be reproduced, modified, distributed,
+transmitted, disclosed, or used in any form or by any means without the
+prior written permission of PyramidTech LLC.
+
+This material must be returned immediately upon request by PyramidTech LLC"
+/****************************************************************************************
+File name:      {file_name}
+  
+Description:    {desc_block}
+  
+Author:         {author}
+  
+Change History:
+02-25-2026     AA  Initial Release
+  
+{closing}
+'''
 
 
 # -----------------------------------------------------------------------------
 # Formatting Helpers (q_data declarations)
 # -----------------------------------------------------------------------------
 
-def _pyramidtech_wrap(content: str, file_name: str, description: str) -> str:
-    """Return RTL content as-is (no header/keywords wrapper)."""
-    return content.rstrip()
+def _pyramidtech_wrap(content: str, file_name: str, description: str, *, author: str = "Ahmed Abou-Auf", quant_pkg_style: bool = False) -> str:
+    """Prepend PyramidTech header, wrap with begin_keywords/end_keywords, and return RTL content."""
+    header = _pyramidtech_header(file_name, description, author=author, quant_pkg_style=quant_pkg_style)
+    body = content.rstrip()
+    # Strip existing begin_keywords/end_keywords to avoid duplication
+    body = re.sub(r'^`begin_keywords\s+"[^"]*"\s*\n?', '', body)
+    body = re.sub(r'\n?`end_keywords\s*$', '', body)
+    body = body.strip()
+    return header + '`begin_keywords "1800-2012"\n\n' + body + '\n\n`end_keywords'
 
 
 def _rtl_header(filename: str, module_name: str, description: str) -> str:
@@ -408,9 +469,10 @@ def _get_quant_pkg_content(weight_width: int) -> str:
     """Generate quant_pkg.sv matching binaryclass_nn reference."""
     if weight_width not in (4, 8, 16):
         weight_width = 16
-    define_line = f"`define Q_INT{weight_width}\n"
-    default_def = "`ifndef Q_INT4\n`ifndef Q_INT8\n`ifndef Q_INT16\n`define Q_INT16\n`endif\n`endif\n`endif\n"
-    body = define_line + default_def + '''package quant_pkg;
+    body = '''package quant_pkg;
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
    // =============================================================
    // Quantization mode (select ONE at compile time)
@@ -447,208 +509,251 @@ def _get_quant_pkg_content(weight_width: int) -> str:
    localparam acc_t ACC_FULL_MAX = {1'b0, {4*Q_WIDTH-1{1'b1}}};
    localparam acc_t ACC_FULL_MIN = {1'b1, {4*Q_WIDTH-1{1'b0}}};
 
-   localparam q_data_t SIGMOID_MAX = 2**(Q_WIDTH-2);
+   localparam q_data_t SIGMOID_MAX = 1 << (Q_WIDTH - 2);
    localparam q_data_t SIGMOID_MIN = 0;
 
 endpackage
 '''
-    return _pyramidtech_wrap(body, "quant_pkg.sv", "Package defining quantization widths, fixed-point data types, and saturation limits.")
+    desc = "Package defining quantization widths, fixed-point data types,\n                and saturation limits for accumulation and activation functions."
+    return _pyramidtech_wrap(body, "quant_pkg.sv", desc, quant_pkg_style=True)
 
 
-EMBEDDED_MAC_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
-
-module mac (
-   input  logic clk,
-   input  logic rst_n,
-   input  logic enable,
-   input  logic clear,
-
-   input  q_data_t a,
-   input  q_data_t b,
-
-   output acc_t acc,
-   output logic valid_out
-);
-
-   // ------------------------------------------------------------
-   // Internal signals
-   // ------------------------------------------------------------
-   q_mult_t mult_reg;
-   acc_t    acc_reg;
-
-   logic enable_q;
-   logic enable_qq;
-
-   // ------------------------------------------------------------
-   // Stage 1: Multiply
-   // ------------------------------------------------------------
-   always_ff @(posedge clk or negedge rst_n) begin
-      if (!rst_n)
-         mult_reg <= '0;
-      else if (clear)
-         mult_reg <= '0;
-      else if (enable)
-         mult_reg <= $signed(a) * $signed(b);
-   end
-
-   // ------------------------------------------------------------
-   // Stage 2: Accumulate
-   // ------------------------------------------------------------
-   always_ff @(posedge clk or negedge rst_n) begin
-      if (!rst_n)
-         acc_reg <= '0;
-      else if (clear)
-         acc_reg <= '0;
-      else if (enable_q)
-         acc_reg <= acc_reg + mult_reg;
-   end
-
-   // ------------------------------------------------------------
-   // Stage 3: Output saturation to ACC full range
-   // ------------------------------------------------------------
-   always_ff @(posedge clk) begin
-      if (acc_reg > $signed(ACC_FULL_MAX))
-         acc <= ACC_FULL_MAX;
-      else if (acc_reg < $signed(ACC_FULL_MIN))
-         acc <= ACC_FULL_MIN;
-      else
-         acc <= acc_reg[4*Q_WIDTH-1:0];
-   end
-
-   // ------------------------------------------------------------
-   // Valid signal pipeline (matches MAC latency)
-   // ------------------------------------------------------------
-   always_ff @(posedge clk or negedge rst_n) begin
-      if (!rst_n) begin
-         enable_q  <= 1'b0;
-         enable_qq <= 1'b0;
-         valid_out <= 1'b0;
-      end
-      else if (clear) begin
-         enable_q  <= 1'b0;
-         enable_qq <= 1'b0;
-         valid_out <= 1'b0;
-      end
-      else begin
-         enable_q  <= enable;
-         enable_qq <= enable_q;
-         valid_out <= enable_qq;
-      end
-   end
-
-endmodule
-'''
-
-
-EMBEDDED_FC_IN_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
-
-module fc_in #(
-   parameter int NUM_NEURONS   = 8,
-   parameter int INPUT_SIZE    = 16,
-   parameter signed BIAS_SCALE  = 0,
-   parameter signed LAYER_SCALE = 12
+EMBEDDED_MAC_SV = '''module mac
+  import quant_pkg::*;
+#(
+  parameter int INPUT_SIZE    = 16
 )(
-   input  logic        clk,
-   input  logic        rst_n,
-   input  logic        valid_in,
-   input  q_data_t     data_in,
-   input  q_data_t     weights[NUM_NEURONS],
-   input  acc_t        biases[NUM_NEURONS],
+  input  logic clk_i,
+  input  logic rst_n_i,
 
-   output q_data_t     data_out[NUM_NEURONS],
-   output logic        valid_out
+  input  logic enable_i,      // Enable MAC operation
+
+  input  q_data_t a_i,        // Signed multiplicand
+  input  q_data_t b_i,        // Signed multiplier
+
+  output acc_t acc_o,         // Saturated accumulator output
+  output logic valid_o        // Output valid (aligned with acc)
 );
 
-   // ------------------------------------------------------------
-   // Internal MAC signals
-   // ------------------------------------------------------------
-   acc_t mac_acc[NUM_NEURONS];
-   acc_t acc_tmp[NUM_NEURONS];
-   acc_t bias_aligned[NUM_NEURONS];
-   acc_t data_out_temp[NUM_NEURONS];
+  timeunit 1ns;
+  timeprecision 1ps;
 
-   logic [$clog2(INPUT_SIZE+1)-1:0] count_out;
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  q_mult_t mult_q;            // Registered multiplication result (Stage 1)
+  acc_t    acc_q;             // Internal accumulator register (Stage 2)
 
-   logic mac_enable;
-   logic mac_clear;
+  logic    enable_q;          // Pipeline stage 1 enable
+  logic    enable_q2;         // Pipeline stage 2 enable
 
-   logic [NUM_NEURONS-1:0] mac_valid_out;
-   logic all_mac_valid;
+  logic [$clog2(INPUT_SIZE + 1) - 1:0] count_q;   //Counter of input data
+  logic clear;
+  logic clear_q;             // Pipeline stage 1 clear
+  logic clear_q2;            // Pipeline stage 2 clear
 
-   // ------------------------------------------------------------
-   // Instantiate MACs
-   // ------------------------------------------------------------
-   genvar i;
-   generate
-      for (i = 0; i < NUM_NEURONS; i++) begin : FC_MACS
-         mac u_mac (
-            .clk(clk),
-            .rst_n(rst_n),
-            .enable(mac_enable),
-            .clear(mac_clear),
-            .a(data_in),
-            .b(weights[i]),
-            .valid_out(mac_valid_out[i]),
-            .acc(mac_acc[i])
-         );
-      end
-   endgenerate
 
-   assign all_mac_valid = &mac_valid_out;
-   assign mac_enable = valid_in;
-   assign mac_clear  = valid_out;
+  assign clear = (count_q == INPUT_SIZE) ? 1'b1 : 1'b0;
 
-   // ------------------------------------------------------------
-   // Count valid inputs and generate valid_out for last input
-   // ------------------------------------------------------------
-   always_ff @(posedge clk or negedge rst_n) begin
-      if (!rst_n) begin
-         count_out <= '0;
-         valid_out <= 1'b0;
-      end else begin
-         valid_out <= 1'b0;
-         if (all_mac_valid) begin
-            if (count_out == INPUT_SIZE-1) begin
-               count_out <= '0;
-               valid_out <= 1'b1;
-            end else begin
-               count_out <= count_out + 1'b1;
-            end
-         end
-      end
-   end
+  // ------------------------------------------------------------
+  // Stage 1: Multiply
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: multiply_stage
+    if (!rst_n_i) begin
+      mult_q  <= '0;
+      count_q <= '0;
+    end
+    else if (clear) begin
+      mult_q  <= '0;
+      count_q <= '0;
+    end
+    else if (enable_i) begin
+      mult_q  <= $signed(a_i) * $signed(b_i);
+      count_q <= count_q + 1;
+    end
+  end: multiply_stage
 
-   // ------------------------------------------------------------
-   // Bias addition, layer scaling, and output saturation
-   // ------------------------------------------------------------
-   generate
-      for (i = 0; i < NUM_NEURONS; i++) begin : FC_BIAS_ADD
-         assign bias_aligned[i] = (BIAS_SCALE >= 0) ? (biases[i] <<< BIAS_SCALE) : (biases[i] >>> -BIAS_SCALE);
-         assign acc_tmp[i] = mac_acc[i] + bias_aligned[i];
-         assign data_out_temp[i] = (LAYER_SCALE >= 0) ? (acc_tmp[i] >>> LAYER_SCALE) : (acc_tmp[i] <<< -LAYER_SCALE);
-         always_ff @(posedge clk or negedge rst_n) begin
-            if (!rst_n)
-               data_out[i] <= '0;
-            else if (count_out == INPUT_SIZE-1) begin
-               if (data_out_temp[i] > ACC_Q_MAX)
-                  data_out[i] <= Q_MAX;
-               else if (data_out_temp[i] < ACC_Q_MIN)
-                  data_out[i] <= Q_MIN;
-               else
-                  data_out[i] <= data_out_temp[i][Q_WIDTH-1:0];
-            end
-         end
-      end
-   endgenerate
+  // ------------------------------------------------------------
+  // Stage 2: Accumulate
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: accumulate_stage
+    if (!rst_n_i) begin
+      acc_q <= '0;
+    end
+    else if (clear_q) begin
+      acc_q <= '0;
+    end
+    else if (enable_q) begin
+      acc_q <= acc_q + mult_q;
+    end
+  end: accumulate_stage
 
-endmodule
+  // ------------------------------------------------------------
+  // Stage 3: Output saturation to ACC full range
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i) begin: saturation_stage
+    if (acc_q > $signed(ACC_FULL_MAX)) begin
+      acc_o <= ACC_FULL_MAX;
+    end
+    else if (acc_q < $signed(ACC_FULL_MIN)) begin
+      acc_o <= ACC_FULL_MIN;
+    end
+    else begin
+      acc_o <= acc_q[4*Q_WIDTH-1:0];
+    end
+  end: saturation_stage
+
+  // ------------------------------------------------------------
+  // Valid signal pipeline (matches MAC latency)
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: valid_pipeline
+    if (!rst_n_i) begin
+      enable_q   <= 1'b0;
+      enable_q2  <= 1'b0;
+      valid_o    <= 1'b0;
+      clear_q    <= 1'b0;
+      clear_q2   <= 1'b0;
+    end
+    else if (clear_q2) begin
+      valid_o    <= 1'b0;
+      enable_q   <= enable_i;
+      enable_q2  <= enable_q;
+      clear_q2   <= 1'b0;
+    end
+    else begin
+      enable_q   <= enable_i;
+      enable_q2  <= enable_q;
+      valid_o    <= enable_q2;
+      clear_q    <= clear;
+      clear_q2   <= clear_q;
+    end
+  end: valid_pipeline
+
+endmodule: mac
 '''
 
 
-EMBEDDED_FC_OUT_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
+EMBEDDED_FC_IN_SV = '''module fc_in
+  import quant_pkg::*;
+#(
+  parameter int    NUM_NEURONS = 8,
+  parameter int    INPUT_SIZE  = 16,
+  parameter signed BIAS_SCALE  = 0,
+  parameter signed LAYER_SCALE = 12
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic valid_i,                  // Input data valid
+  input  q_data_t data_i,                // Input data
+  input  q_data_t weights_i[NUM_NEURONS], // Weight vector per neuron
+  input  acc_t    biases_i[NUM_NEURONS],  // Biases vector per neuron
+
+  output q_data_t data_o[NUM_NEURONS],    // FC layer output
+  output logic    valid_o                // Output valid pulse
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  acc_t mac_acc_q[NUM_NEURONS];          // Registered MAC outputs
+  acc_t acc_tmp_s[NUM_NEURONS];          // Combinational bias addition
+  acc_t bias_aligned_s[NUM_NEURONS];     // Combinational bias alignment
+  acc_t data_out_temp_s[NUM_NEURONS];    // Combinational layer scaling
+
+  logic [$clog2(INPUT_SIZE + 1) - 1:0] count_q;
+
+  logic mac_enable_s;
+  logic [NUM_NEURONS- 1:0] mac_valid_q;
+  logic all_mac_valid_s;
+
+  // ------------------------------------------------------------
+  // Instantiate MAC units
+  // ------------------------------------------------------------
+  genvar i;
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_mac_units
+      mac #(
+          .INPUT_SIZE(INPUT_SIZE)
+      ) u_mac (
+        .clk_i     (clk_i),
+        .rst_n_i   (rst_n_i),
+        .enable_i  (mac_enable_s),
+        .a_i       (data_i),
+        .b_i       (weights_i[i]),
+        .valid_o   (mac_valid_q[i]),
+        .acc_o     (mac_acc_q[i])
+      );
+    end
+  endgenerate
+
+  assign all_mac_valid_s = &mac_valid_q;
+  assign mac_enable_s    = valid_i;
+
+  // ------------------------------------------------------------
+  // Count valid inputs and generate valid_o for last input
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : count_logic
+    if (!rst_n_i) begin
+      count_q <= '0;
+      valid_o <= 1'b0;
+    end
+    else begin
+      valid_o <= 1'b0;
+      if (all_mac_valid_s) begin
+        if (count_q == (INPUT_SIZE - 1)) begin
+          count_q <= '0;
+          valid_o <= 1'b1;
+        end
+        else begin
+          count_q <= count_q + 1'b1;
+        end
+      end
+    end
+  end : count_logic
+
+  // ------------------------------------------------------------
+  // Bias addition, layer scaling, and output saturation
+  // ------------------------------------------------------------
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_output_path
+      assign bias_aligned_s[i] = (BIAS_SCALE >= 0) ?
+                                 (biases_i[i] <<< BIAS_SCALE) :
+                                 (biases_i[i] >>> -BIAS_SCALE);
+
+      assign acc_tmp_s[i] = mac_acc_q[i] + bias_aligned_s[i];
+
+      assign data_out_temp_s[i] = (LAYER_SCALE >= 0) ?
+                                  (acc_tmp_s[i] >>> LAYER_SCALE) :
+                                  (acc_tmp_s[i] <<< -LAYER_SCALE);
+
+      always_ff @(posedge clk_i or negedge rst_n_i) begin : saturation_reg
+        if (!rst_n_i) begin
+          data_o[i] <= '0;
+        end
+        else if (count_q == (INPUT_SIZE-1)) begin
+          if (data_out_temp_s[i] > ACC_Q_MAX) begin
+            data_o[i] <= Q_MAX;
+          end
+          else if (data_out_temp_s[i] < ACC_Q_MIN) begin
+            data_o[i] <= Q_MIN;
+          end
+          else begin
+            data_o[i] <= data_out_temp_s[i][Q_WIDTH-1:0];
+          end
+        end
+      end : saturation_reg
+    end
+  endgenerate
+
+endmodule : fc_in
+'''
+
+
+EMBEDDED_FC_OUT_SV = '''import quant_pkg::*;
 
 module fc_out #(
    parameter int      NUM_NEURONS = 2,
@@ -666,6 +771,9 @@ module fc_out #(
    output q_data_t data_out,
    output logic    valid_out
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
    // ============================================================
    // Stage 0: Multipliers (combinational)
@@ -757,8 +865,7 @@ endmodule
 '''
 
 
-EMBEDDED_RELU_LAYER_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
+EMBEDDED_RELU_LAYER_SV = '''import quant_pkg::*;
 
 module relu_layer (
    input  logic clk,
@@ -769,6 +876,9 @@ module relu_layer (
    output q_data_t data_out,
    output logic valid_out
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
    // ============================================================
    // ReLU logic with pipelined valid signal
@@ -788,8 +898,7 @@ endmodule
 '''
 
 # Legacy hierarchical format: relu for array (element-wise)
-EMBEDDED_RELU_LAYER_ARRAY_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
+EMBEDDED_RELU_LAYER_ARRAY_SV = '''import quant_pkg::*;
 
 module relu_layer_array #(
    parameter int NUM_NEURONS = 8
@@ -802,6 +911,9 @@ module relu_layer_array #(
    output q_data_t data_out[NUM_NEURONS],
    output logic valid_out
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
    integer i;
 
@@ -855,168 +967,252 @@ BINARYCLASS_QUANT_PKG_SV = '''package quant_pkg;
    localparam acc_t ACC_FULL_MAX = {{1'b0, {{4*Q_WIDTH-1{{1'b1}}}}}};
    localparam acc_t ACC_FULL_MIN = {{1'b1, {{4*Q_WIDTH-1{{1'b0}}}}}};
 
-   localparam q_data_t SIGMOID_MAX = 2**(Q_WIDTH-2);
+   localparam q_data_t SIGMOID_MAX = 1 << (Q_WIDTH - 2);
    localparam q_data_t SIGMOID_MIN = 0;
 
 endpackage
 '''
 
-BINARYCLASS_MAC_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
-
-module mac (
-    input  logic clk_i,
-    input  logic rst_n_i,
-    input  logic enable_i,
-    input  logic clear_i,
-    input  q_data_t a_i,
-    input  q_data_t b_i,
-    output acc_t acc_o,
-    output logic valid_o
-);
-
-    q_mult_t mult_reg;
-    acc_t acc_reg;
-    logic enable_q;
-    logic enable_qq;
-
-    always_ff @(posedge clk_i or negedge rst_n_i) begin
-        if (!rst_n_i)
-            mult_reg <= '0;
-        else if (clear_i)
-            mult_reg <= '0;
-        else if (enable_i)
-            mult_reg <= $signed(a_i) * $signed(b_i);
-    end
-
-    always_ff @(posedge clk_i or negedge rst_n_i) begin
-        if (!rst_n_i)
-            acc_reg <= '0;
-        else if (clear_i)
-            acc_reg <= '0;
-        else if (enable_q)
-            acc_reg <= acc_reg + mult_reg;
-    end
-
-    always_ff @(posedge clk_i) begin
-        if (acc_reg > $signed(ACC_FULL_MAX))
-            acc_o <= ACC_FULL_MAX;
-        else if (acc_reg < $signed(ACC_FULL_MIN))
-            acc_o <= ACC_FULL_MIN;
-        else
-            acc_o <= acc_reg[4*Q_WIDTH-1:0];
-    end
-
-    always_ff @(posedge clk_i or negedge rst_n_i) begin
-        if (!rst_n_i) begin
-            enable_q  <= 1'b0;
-            enable_qq <= 1'b0;
-            valid_o   <= 1'b0;
-        end else if (clear_i) begin
-            enable_q  <= 1'b0;
-            enable_qq <= 1'b0;
-            valid_o   <= 1'b0;
-        end else begin
-            enable_q  <= enable_i;
-            enable_qq <= enable_q;
-            valid_o   <= enable_qq;
-        end
-    end
-
-endmodule
-'''
-
-BINARYCLASS_FC_IN_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
-
-module fc_in #(
-    parameter int NUM_NEURONS   = 8,
-    parameter int INPUT_SIZE    = 16,
-    parameter signed BIAS_SCALE  = 0,
-    parameter signed LAYER_SCALE = 12
+BINARYCLASS_MAC_SV = '''module mac
+  import quant_pkg::*;
+#(
+  parameter int INPUT_SIZE    = 16
 )(
-    input  logic clk_i,
-    input  logic rst_n_i,
-    input  logic valid_i,
-    input  q_data_t data_i,
-    input  q_data_t weights_i[NUM_NEURONS],
-    input  acc_t biases_i[NUM_NEURONS],
-    output q_data_t data_o[NUM_NEURONS],
-    output logic valid_o
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic enable_i,      // Enable MAC operation
+
+  input  q_data_t a_i,        // Signed multiplicand
+  input  q_data_t b_i,        // Signed multiplier
+
+  output acc_t acc_o,         // Saturated accumulator output
+  output logic valid_o        // Output valid (aligned with acc)
 );
 
-    acc_t mac_acc[NUM_NEURONS];
-    acc_t acc_tmp[NUM_NEURONS];
-    acc_t bias_aligned[NUM_NEURONS];
-    acc_t data_out_temp[NUM_NEURONS];
-    logic [$clog2(INPUT_SIZE+1)-1:0] count_out;
-    logic mac_enable;
-    logic mac_clear;
-    logic [NUM_NEURONS-1:0] mac_valid_out;
-    logic all_mac_valid;
+  timeunit 1ns;
+  timeprecision 1ps;
 
-    genvar i;
-    generate
-        for (i = 0; i < NUM_NEURONS; i = i + 1) begin : FC_MACS
-            mac u_mac (
-                .clk_i(clk_i),
-                .rst_n_i(rst_n_i),
-                .enable_i(mac_enable),
-                .clear_i(mac_clear),
-                .a_i(data_i),
-                .b_i(weights_i[i]),
-                .valid_o(mac_valid_out[i]),
-                .acc_o(mac_acc[i])
-            );
-        end
-    endgenerate
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  q_mult_t mult_q;            // Registered multiplication result (Stage 1)
+  acc_t    acc_q;             // Internal accumulator register (Stage 2)
 
-    assign all_mac_valid = &mac_valid_out;
-    assign mac_enable = valid_i;
-    assign mac_clear  = valid_o;
+  logic    enable_q;          // Pipeline stage 1 enable
+  logic    enable_q2;         // Pipeline stage 2 enable
 
-    always_ff @(posedge clk_i or negedge rst_n_i) begin
-        if (!rst_n_i) begin
-            count_out <= '0;
-            valid_o   <= 1'b0;
-        end else begin
-            valid_o <= 1'b0;
-            if (all_mac_valid) begin
-                if (count_out == INPUT_SIZE-1) begin
-                    count_out <= 0;
-                    valid_o   <= 1'b1;
-                end else begin
-                    count_out <= count_out + 1'b1;
-                end
-            end
-        end
+  logic [$clog2(INPUT_SIZE + 1) - 1:0] count_q;   //Counter of input data
+  logic clear;
+  logic clear_q;             // Pipeline stage 1 clear
+  logic clear_q2;            // Pipeline stage 2 clear
+
+
+  assign clear = (count_q == INPUT_SIZE) ? 1'b1 : 1'b0;
+
+  // ------------------------------------------------------------
+  // Stage 1: Multiply
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: multiply_stage
+    if (!rst_n_i) begin
+      mult_q  <= '0;
+      count_q <= '0;
     end
+    else if (clear) begin
+      mult_q  <= '0;
+      count_q <= '0;
+    end
+    else if (enable_i) begin
+      mult_q  <= $signed(a_i) * $signed(b_i);
+      count_q <= count_q + 1;
+    end
+  end: multiply_stage
 
-    generate
-        for (i = 0; i < NUM_NEURONS; i++) begin : FC_BIAS_ADD
-            assign bias_aligned[i] = (BIAS_SCALE >= 0) ? (biases_i[i] <<< BIAS_SCALE) : (biases_i[i] >>> -BIAS_SCALE);
-            assign acc_tmp[i] = mac_acc[i] + bias_aligned[i];
-            assign data_out_temp[i] = (LAYER_SCALE >= 0) ? (acc_tmp[i] >>> LAYER_SCALE) : (acc_tmp[i] <<< -LAYER_SCALE);
-            always_ff @(posedge clk_i or negedge rst_n_i) begin
-                if (!rst_n_i)
-                    data_o[i] <= '0;
-                else if (count_out == INPUT_SIZE-1) begin
-                    if (data_out_temp[i] > ACC_Q_MAX)
-                        data_o[i] <= Q_MAX;
-                    else if (data_out_temp[i] < ACC_Q_MIN)
-                        data_o[i] <= Q_MIN;
-                    else
-                        data_o[i] <= data_out_temp[i][Q_WIDTH-1:0];
-                end
-            end
-        end
-    endgenerate
+  // ------------------------------------------------------------
+  // Stage 2: Accumulate
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: accumulate_stage
+    if (!rst_n_i) begin
+      acc_q <= '0;
+    end
+    else if (clear_q) begin
+      acc_q <= '0;
+    end
+    else if (enable_q) begin
+      acc_q <= acc_q + mult_q;
+    end
+  end: accumulate_stage
 
-endmodule
+  // ------------------------------------------------------------
+  // Stage 3: Output saturation to ACC full range
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i) begin: saturation_stage
+    if (acc_q > $signed(ACC_FULL_MAX)) begin
+      acc_o <= ACC_FULL_MAX;
+    end
+    else if (acc_q < $signed(ACC_FULL_MIN)) begin
+      acc_o <= ACC_FULL_MIN;
+    end
+    else begin
+      // Truncate/slice using explicit width literals
+      acc_o <= acc_q[4*Q_WIDTH-1:0];
+    end
+  end: saturation_stage
+
+  // ------------------------------------------------------------
+  // Valid signal pipeline (matches MAC latency)
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin: valid_pipeline
+    if (!rst_n_i) begin
+      enable_q   <= 1'b0;
+      enable_q2  <= 1'b0;
+      valid_o    <= 1'b0;
+      clear_q    <= 1'b0;
+      clear_q2   <= 1'b0;
+    end
+    else if (clear_q2) begin
+      valid_o    <= 1'b0;
+      enable_q   <= enable_i;
+      enable_q2  <= enable_q;
+      clear_q2   <= 1'b0;
+    end
+    else begin
+      enable_q   <= enable_i;
+      enable_q2  <= enable_q;
+      valid_o    <= enable_q2;
+      clear_q    <= clear;
+      clear_q2   <= clear_q;
+    end
+  end: valid_pipeline
+
+endmodule: mac
 '''
 
-BINARYCLASS_FC_OUT_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
+BINARYCLASS_FC_IN_SV = '''module fc_in
+  import quant_pkg::*;
+#(
+  parameter int    NUM_NEURONS = 8,
+  parameter int    INPUT_SIZE  = 16,
+  parameter signed BIAS_SCALE  = 0,
+  parameter signed LAYER_SCALE = 12
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  logic valid_i,                  // Input data valid
+  input  q_data_t data_i,                // Input data
+  input  q_data_t weights_i[NUM_NEURONS], // Weight vector per neuron
+  input  acc_t    biases_i[NUM_NEURONS],  // Biases vector per neuron
+
+  output q_data_t data_o[NUM_NEURONS],    // FC layer output
+  output logic    valid_o                // Output valid pulse
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals
+  // ------------------------------------------------------------
+  acc_t mac_acc_q[NUM_NEURONS];          // Registered MAC outputs
+  acc_t acc_tmp_s[NUM_NEURONS];          // Combinational bias addition
+  acc_t bias_aligned_s[NUM_NEURONS];     // Combinational bias alignment
+  acc_t data_out_temp_s[NUM_NEURONS];    // Combinational layer scaling
+
+  logic [$clog2(INPUT_SIZE + 1) - 1:0] count_q;
+
+  logic mac_enable_s;
+  logic [NUM_NEURONS- 1:0] mac_valid_q;
+  logic all_mac_valid_s;
+
+  // ------------------------------------------------------------
+  // Instantiate MAC units
+  // ------------------------------------------------------------
+  genvar i;
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_mac_units
+      mac #(
+          .INPUT_SIZE(INPUT_SIZE)
+      ) u_mac (
+        .clk_i     (clk_i),
+        .rst_n_i     (rst_n_i),
+        .enable_i  (mac_enable_s),
+        .a_i       (data_i),
+        .b_i       (weights_i[i]),
+        .valid_o   (mac_valid_q[i]),
+        .acc_o     (mac_acc_q[i])
+      );
+    end
+  endgenerate
+
+  assign all_mac_valid_s = &mac_valid_q;
+  assign mac_enable_s    = valid_i;
+
+  // ------------------------------------------------------------
+  // Count valid inputs and generate valid_o for last input
+  // ------------------------------------------------------------
+  always_ff @(posedge clk_i or negedge rst_n_i) begin : count_logic
+    if (!rst_n_i) begin
+      count_q <= '0;
+      valid_o <= 1'b0;
+    end
+    else begin
+      valid_o <= 1'b0;
+      if (all_mac_valid_s) begin
+        if (count_q == (INPUT_SIZE - 1)) begin
+          count_q <= '0;
+          valid_o <= 1'b1;
+        end
+        else begin
+          count_q <= count_q + 1'b1;
+        end
+      end
+    end
+  end : count_logic
+
+  // ------------------------------------------------------------
+  // Bias addition, layer scaling, and output saturation
+  // ------------------------------------------------------------
+  generate
+    for (i = 0; i < NUM_NEURONS; i++) begin : gen_output_path
+      // Align bias to accumulator width
+      assign bias_aligned_s[i] = (BIAS_SCALE >= 0) ?
+                                 (biases_i[i] <<< BIAS_SCALE) :
+                                 (biases_i[i] >>> -BIAS_SCALE);
+
+      // Add bias to MAC output
+      assign acc_tmp_s[i] = mac_acc_q[i] + bias_aligned_s[i];
+
+      // Apply layer scaling
+      assign data_out_temp_s[i] = (LAYER_SCALE >= 0) ?
+                                  (acc_tmp_s[i] >>> LAYER_SCALE) :
+                                  (acc_tmp_s[i] <<< -LAYER_SCALE);
+
+      // Register output with saturation logic
+      always_ff @(posedge clk_i or negedge rst_n_i) begin : saturation_reg
+        if (!rst_n_i) begin
+          data_o[i] <= '0;
+        end
+        else if (count_q == (INPUT_SIZE-1)) begin
+          if (data_out_temp_s[i] > ACC_Q_MAX) begin
+            data_o[i] <= Q_MAX;
+          end
+          else if (data_out_temp_s[i] < ACC_Q_MIN) begin
+            data_o[i] <= Q_MIN;
+          end
+          else begin
+            // Cast to narrow quantized data type
+            data_o[i] <= data_out_temp_s[i][Q_WIDTH-1:0];
+          end
+        end
+      end : saturation_reg
+    end
+  endgenerate
+
+endmodule : fc_in
+'''
+
+BINARYCLASS_FC_OUT_SV = '''import quant_pkg::*;
 
 module fc_out #(
     parameter int NUM_NEURONS = 2,
@@ -1032,6 +1228,9 @@ module fc_out #(
     output q_data_t data_o,
     output logic valid_o
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
     acc_t mult_res[NUM_NEURONS];
     acc_t bias_pipe;
@@ -1104,8 +1303,7 @@ module fc_out #(
 endmodule
 '''
 
-BINARYCLASS_RELU_LAYER_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
+BINARYCLASS_RELU_LAYER_SV = '''import quant_pkg::*;
 
 module relu_layer (
     input  logic clk_i,
@@ -1115,6 +1313,9 @@ module relu_layer (
     output q_data_t data_o,
     output logic valid_o
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
@@ -1130,8 +1331,7 @@ module relu_layer (
 endmodule
 '''
 
-BINARYCLASS_SIGMOID_LAYER_SV = '''`timescale 1ns/1ps
-import quant_pkg::*;
+BINARYCLASS_SIGMOID_LAYER_SV = '''import quant_pkg::*;
 
 module sigmoid_layer (
     input  logic clk_i,
@@ -1141,6 +1341,9 @@ module sigmoid_layer (
     output q_data_t data_o,
     output logic valid_o
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
@@ -1160,9 +1363,7 @@ module sigmoid_layer (
 endmodule
 '''
 
-BINARYCLASS_SYNC_FIFO_SV = '''`timescale 1ns/1ps
-
-module sync_fifo #(
+BINARYCLASS_SYNC_FIFO_SV = '''module sync_fifo #(
   parameter int DATA_WIDTH = 32,
   parameter int DEPTH      = 1024
 )(
@@ -3605,7 +3806,6 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
     param_lines.append(f"  parameter int FIFO_DEPTH            = 32'd{params.get('FIFO_DEPTH', 1024)}")
     param_str = "\n".join(param_lines)
 
-    last_rom = params.get(f"FC_{num_blocks}_ROM_DEPTH", 1)
     sig_lines = []
     block_inst = []
     prev_valid = "s_axis_tvalid_i"
@@ -3613,10 +3813,14 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
 
     for b in range(1, num_blocks + 1):
         p = f"FC_{b}"
-        neurons = params.get(f"{p}_NEURONS", 1)
         is_last = b == num_blocks
-        sig_lines.append(f"  // Block {b} signals")
-        sig_lines.append(f"  q_data_t fc{b}_out_s[{neurons}];")
+        in_scale = params.get(f"{p}_IN_LAYER_SCALE", 8)
+        in_bias = params.get(f"{p}_IN_BIAS_SCALE", 0)
+        out_scale = params.get(f"{p}_OUT_LAYER_SCALE", 8)
+        out_bias = params.get(f"{p}_OUT_BIAS_SCALE", 0)
+
+        sig_lines.append(f"  // Layer {b} signals")
+        sig_lines.append(f"  q_data_t fc{b}_out_s[{p}_NEURONS];")
         sig_lines.append(f"  logic    fc{b}_valid_s;")
         sig_lines.append(f"  q_data_t fc{b}_pre_act_s;")
         if not is_last:
@@ -3630,7 +3834,82 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
             sig_lines.append(f"  q_data_t logits_s;")
         sig_lines.append("")
 
-        block_inst.append(f"  // Block {b}: fc_in + fc_out + activation")
+        if is_last:
+            block_inst.append(f"  // -------------------------------------------------------------------------")
+            block_inst.append(f"  // Layer {b}: Fully Connected -> Output Engine")
+            block_inst.append(f"  // -------------------------------------------------------------------------")
+        else:
+            block_inst.append(f"  // -------------------------------------------------------------------------")
+            block_inst.append(f"  // Layer {b}: Fully Connected -> Sequential ROM -> ReLU Activation")
+            block_inst.append(f"  // -------------------------------------------------------------------------")
+        block_inst.append("")
+
+        # fc_proj_in Fixed-Point Configuration comment block
+        if b == 1:
+            block_inst.append("  // ============================================================")
+            block_inst.append("  // fc_proj_in – Fixed-Point Configuration (First FC Layer)")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  //")
+            block_inst.append("  // Input  : signed int8  (Q1.6)")
+            block_inst.append("  // Weight : signed int8  (Q0.8)")
+            block_inst.append("  // Bias   : zero (no bias contribution in this layer)")
+            block_inst.append("  //")
+            block_inst.append("  // MAC Operation:")
+            block_inst.append("  //   Each neuron accumulates multiple products:")
+            block_inst.append("  //       Q1.6 × Q0.8 → Q1.14")
+            block_inst.append("  //   Accumulator grows in integer width due to summation.")
+            block_inst.append("  //")
+            block_inst.append("  // Bias Alignment:")
+            block_inst.append(f"  //   BIAS_SCALE = {in_bias} (bias alignment not required).")
+            block_inst.append("  //")
+            block_inst.append("  // Layer Scaling:")
+            block_inst.append("  //   Accumulator fractional bits reduced using layer scaling.")
+            block_inst.append(f"  //   LAYER_SCALE = {in_scale}")
+            block_inst.append(f"  //   Right shift by {in_scale} bits.")
+            block_inst.append("  //")
+            block_inst.append("  // Final Output:")
+            block_inst.append("  //   Saturated and truncated to signed int8 (Q5.2).")
+            block_inst.append("  // ============================================================")
+        else:
+            fc_proj_name = f"fc_{b}_proj_in"
+            block_inst.append("  // ============================================================")
+            block_inst.append(f"  // {fc_proj_name} – Fixed-Point Configuration")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  //")
+            if is_last:
+                block_inst.append("  // Input  : signed int8  (Q5.2)")
+                block_inst.append("  // Weight : signed int8  (Q2.6)")
+                block_inst.append("  //")
+                block_inst.append("  // MAC Operation:")
+                block_inst.append("  //   Q5.2 × Q2.6 → Q7.8")
+                block_inst.append("  //")
+                block_inst.append("  // Bias Alignment:")
+                block_inst.append(f"  //   BIAS_SCALE = {in_bias}")
+                block_inst.append("  //")
+                block_inst.append("  // Layer Scaling:")
+                block_inst.append(f"  //   LAYER_SCALE = {in_scale}")
+                block_inst.append(f"  //   Right shift by {in_scale} bits.")
+                block_inst.append("  //")
+                block_inst.append("  // Final Output:")
+                block_inst.append("  //   Saturated and truncated to signed int8 (Q6.1).")
+            else:
+                block_inst.append("  // Input  : signed int8  (Q5.2)")
+                block_inst.append("  // Weight : signed int8  (Q1.7)")
+                block_inst.append("  //")
+                block_inst.append("  // MAC Operation:")
+                block_inst.append("  //   Q5.2 × Q1.7 → Q6.9")
+                block_inst.append("  //")
+                block_inst.append("  // Bias Alignment:")
+                block_inst.append(f"  //   BIAS_SCALE = {in_bias}")
+                block_inst.append("  //")
+                block_inst.append("  // Layer Scaling:")
+                block_inst.append(f"  //   LAYER_SCALE = {in_scale}")
+                block_inst.append(f"  //   Right shift by {in_scale} bits.")
+                block_inst.append("  //")
+                block_inst.append("  // Final Output:")
+                block_inst.append("  //   Saturated and truncated to signed int8 (Q5.2).")
+            block_inst.append("  // ============================================================")
+        block_inst.append("")
         block_inst.append(f"  fc_in_layer #(")
         block_inst.append(f"    .NUM_NEURONS ({p}_NEURONS),")
         block_inst.append(f"    .INPUT_SIZE  ({p}_INPUT_SIZE),")
@@ -3644,6 +3923,68 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
         block_inst.append(f"    .data_o  (fc{b}_out_s),")
         block_inst.append(f"    .valid_o (fc{b}_valid_s)")
         block_inst.append(f"  );")
+        # fc_proj_out Fixed-Point Configuration comment block
+        if b == 1:
+            block_inst.append("  // ============================================================")
+            block_inst.append("  // fc_proj_out – Fixed-Point Configuration (Layer Output)")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  //")
+            block_inst.append("  // Input  : signed int8  (Q5.2)")
+            block_inst.append("  // Weight : signed int8  (Q1.7)")
+            block_inst.append("  // Bias   : signed int8  (Q?)")
+            block_inst.append("  // ")
+            block_inst.append("  // MAC Operation:")
+            block_inst.append("  //   Q5.2 × Q1.7 → Q6.9")
+            block_inst.append("  //")
+            block_inst.append("  // Bias Alignment:")
+            block_inst.append(f"  //   BIAS_SCALE = {out_bias}")
+            block_inst.append("  //")
+            block_inst.append("  // Layer Scaling:")
+            block_inst.append(f"  //   LAYER_SCALE = {out_scale}")
+            block_inst.append(f"  //   Right shift by {out_scale} bits.")
+            block_inst.append("  //")
+            block_inst.append("  // Final Output:")
+            block_inst.append("  //   Saturated and truncated to signed int8 (Q5.2).")
+            block_inst.append("  // ============================================================")
+        else:
+            block_inst.append("  // ============================================================")
+            block_inst.append(f"  // fc_{b}_proj_out – Fixed-Point Configuration")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  //")
+            if is_last:
+                block_inst.append("  // Input  : signed int8  (Q6.1)")
+                block_inst.append("  // Weight : signed int8  (Q2.6)")
+                block_inst.append("  //")
+                block_inst.append("  // MAC Operation:")
+                block_inst.append("  //   Q6.1 × Q2.6 → Q8.7")
+                block_inst.append("  //")
+                block_inst.append("  // Bias Alignment:")
+                block_inst.append(f"  //   BIAS_SCALE = {out_bias}")
+                block_inst.append("  //")
+                block_inst.append("  // Layer Scaling:")
+                block_inst.append(f"  //   LAYER_SCALE = {out_scale}")
+                block_inst.append(f"  //   Right shift by {out_scale} bits.")
+                block_inst.append("  //")
+                block_inst.append("  // Final Output:")
+                block_inst.append("  //   Saturated and truncated to signed int8 (Q6.1).")
+            else:
+                block_inst.append("  // Input  : signed int8  (Q5.2)")
+                block_inst.append("  // Weight : signed int8  (Q1.7)")
+                block_inst.append("  //")
+                block_inst.append("  // MAC Operation:")
+                block_inst.append("  //   Q5.2 × Q1.7 → Q6.9")
+                block_inst.append("  //")
+                block_inst.append("  // Bias Alignment:")
+                block_inst.append(f"  //   BIAS_SCALE = {out_bias}")
+                block_inst.append("  //")
+                block_inst.append("  // Layer Scaling:")
+                block_inst.append(f"  //   LAYER_SCALE = {out_scale}")
+                block_inst.append(f"  //   Right shift by {out_scale} bits.")
+                block_inst.append("  //")
+                block_inst.append("  // Final Output:")
+                block_inst.append("  //   Saturated and truncated to signed int8 (Q5.2).")
+            block_inst.append("  // ============================================================")
+        block_inst.append("")
         block_inst.append(f"  fc_out_layer #(")
         block_inst.append(f"    .NUM_NEURONS ({p}_NEURONS),")
         block_inst.append(f"    .ROM_DEPTH   ({p}_ROM_DEPTH),")
@@ -3658,6 +3999,19 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
         block_inst.append(f"    .valid_o (relu{b}_valid_i_s)" if not is_last else f"    .valid_o (sigmoid_valid_i_s)")
         block_inst.append(f"  );")
         if not is_last:
+            block_inst.append("")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  // ReLU Layer – Fixed-Point Configuration")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  //")
+            block_inst.append("  // Input  : signed int8 (Q5.2)")
+            block_inst.append("  // Output : signed int8 (Q5.2)")
+            block_inst.append("  //")
+            block_inst.append("  // Operation:")
+            block_inst.append("  //   Applies ReLU activation: output = max(0, input)")
+            block_inst.append("  //   Fixed-point format is unchanged.")
+            block_inst.append("  //")
+            block_inst.append("  // ============================================================")
             block_inst.append(f"  relu_layer u_relu{b} (")
             block_inst.append(f"    .clk_i   (clk_i),")
             block_inst.append(f"    .rst_n_i   (rst_n_i),")
@@ -3669,6 +4023,38 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
             prev_valid = f"relu{b}_valid_o_s"
             prev_data = f"fc{b}_post_relu_s"
         else:
+            block_inst.append("")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  // Sigmoid Approximation – Fixed-Point Configuration")
+            block_inst.append("  // ============================================================")
+            block_inst.append("  //")
+            block_inst.append("  // Input  : signed int8 (Q6.1)")
+            block_inst.append("  //          Output of the final fully-connected layer.")
+            block_inst.append("  //")
+            block_inst.append("  // Operation:")
+            block_inst.append("  //   A simplified sigmoid approximation is applied to convert")
+            block_inst.append("  //   the network logit into a binary classification result.")
+            block_inst.append("  //")
+            block_inst.append("  // Decision Rule:")
+            block_inst.append("  //   The sigmoid output is thresholded at 0:")
+            block_inst.append("  //")
+            block_inst.append("  //       if (logit >= 0) → class = 1")
+            block_inst.append("  //       if (logit <  0) → class = 0")
+            block_inst.append("  //")
+            block_inst.append("  // Output Encoding:")
+            block_inst.append("  //   The result is encoded using fixed-point format:")
+            block_inst.append("  //")
+            block_inst.append("  //       class = 0 → 0x00")
+            block_inst.append("  //       class = 1 → 0x40")
+            block_inst.append("  //")
+            block_inst.append("  //   where:")
+            block_inst.append("  //       0x00 represents 0.0")
+            block_inst.append("  //       0x40 represents 1.0 in Q1.6 format.")
+            block_inst.append("  //")
+            block_inst.append("  // Final Output:")
+            block_inst.append("  //   Binary classification result packed into the")
+            block_inst.append("  //   AXI4-Stream prediction output.")
+            block_inst.append("  // ============================================================")
             block_inst.append(f"  sigmoid_layer u_sigmoid_layer (")
             block_inst.append(f"    .clk_i   (clk_i),")
             block_inst.append(f"    .rst_n_i   (rst_n_i),")
@@ -3679,6 +4065,7 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
             block_inst.append(f"  );")
         block_inst.append("")
 
+    sig_lines.append("  //FIFO signals")
     sig_lines.append("  logic fifo_empty_s;")
     sig_lines.append("  logic fifo_empty_q;")
     sig_lines.append("  logic fifo_full_s;")
@@ -3687,11 +4074,12 @@ def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) ->
     sig_lines.append("  logic fifo_read_en_q;")
     sig_lines.append("  logic [DATA_WIDTH-1:0] fifo_read_data_s;")
     sig_lines.append("  logic [DATA_WIDTH-1:0] fifo_write_data_s;")
-    sig_lines.append(f"  logic [$clog2({last_rom} + 1) - 1:0] out_count_q;")
+    last_rom_param = f"FC_{num_blocks}_ROM_DEPTH"
+    sig_lines.append("  // Registered counter for output stream tracking")
+    sig_lines.append(f"  logic [$clog2({last_rom_param} + 1) - 1:0] out_count_q;")
     sig_lines.append("  logic tvalid_q;")
 
-    body = f'''`begin_keywords "1800-2012"
-module binaryclass_NN 
+    body = f'''module binaryclass_NN 
   import quant_pkg::*;
 #(
 {param_str}
@@ -3699,10 +4087,12 @@ module binaryclass_NN
   input  logic clk_i,
   input  logic rst_n_i,
 
+  // AXI4-Stream Slave Interface: Data applied for prediction
   input  q_data_t s_axis_tdata_i,
   input  logic    s_axis_tvalid_i,
   input  logic    s_axis_tlast_i,
 
+  // AXI4-Stream Master Interface: Prediction result data
   output logic [DATA_WIDTH-1:0]       m_axis_prediction_tdata_o,
   output logic [KEEP_WIDTH-1:0]       m_axis_prediction_tkeep_o,
   output logic                        m_axis_prediction_tvalid_o,
@@ -3712,6 +4102,10 @@ module binaryclass_NN
 
   timeunit 1ns;
   timeprecision 1ps;
+
+  // -------------------------------------------------------------------------
+  // Internal signals (Suffixes: _s = signal/wire, _q = register/flop)
+  // -------------------------------------------------------------------------
 
 {"".join(s + chr(10) for s in sig_lines)}
 
@@ -3731,6 +4125,9 @@ module binaryclass_NN
     .empty_o     (fifo_empty_s)
 );
 
+  // ------------------------------------------------------------
+  // FIFO Read Enable Pipeline
+  // ------------------------------------------------------------
 always_ff @(posedge clk_i or negedge rst_n_i) begin : fifo_read_pipe
   if (!rst_n_i)
     fifo_read_en_q <= 1'b0;
@@ -3738,42 +4135,56 @@ always_ff @(posedge clk_i or negedge rst_n_i) begin : fifo_read_pipe
     fifo_read_en_q <= fifo_read_en_s;
 end : fifo_read_pipe
 
+  // ------------------------------------------------------------
+  // AXI4-Stream Output Logic
+  // ------------------------------------------------------------
 always_ff @(posedge clk_i or negedge rst_n_i) begin : axi_output_logic
   if (!rst_n_i) begin
     m_axis_prediction_tdata_o <= 32'h0;
     tvalid_q                <= 1'b0;
   end
   else if (fifo_read_en_q) begin
+    // Capture FIFO output data
     m_axis_prediction_tdata_o <= fifo_read_data_s;
     tvalid_q                <= 1'b1;
   end
   else if (m_axis_prediction_tready_i) begin
+    // Clear valid when downstream accepts data
     tvalid_q <= 1'b0;
   end
 end : axi_output_logic
 
+
+  // ------------------------------------------------------------
+  // Output Stream Tracking for AXI TLAST Generation
+  // ------------------------------------------------------------
 always_ff @(posedge clk_i or negedge rst_n_i) begin : output_tracking
   if (!rst_n_i) begin
     out_count_q <= '0;
   end
   else if (m_axis_prediction_tvalid_o && m_axis_prediction_tready_i) begin
-    if (out_count_q == ({last_rom} - 1))
+    if (out_count_q == ({last_rom_param} - 1))
       out_count_q <= '0;
     else
       out_count_q <= out_count_q + 1'b1;
   end
 end : output_tracking
 
+  // ------------------------------------------------------------
+  // FIFO Control Signals
+  // ------------------------------------------------------------
 assign fifo_write_en_s   = sigmoid_valid_o_s && !fifo_full_s;
 assign fifo_read_en_s    = !fifo_empty_s && m_axis_prediction_tready_i;
 assign fifo_write_data_s = {{24'h0, sigmoid_data_s}};
 
+  // ------------------------------------------------------------
+  // Prediction AXI Stream
+  // ------------------------------------------------------------
 assign m_axis_prediction_tvalid_o = tvalid_q;
 assign m_axis_prediction_tkeep_o  = 4'h1;
-assign m_axis_prediction_tlast_o = (m_axis_prediction_tvalid_o && (out_count_q == ({last_rom} - 1)));
+assign m_axis_prediction_tlast_o = (m_axis_prediction_tvalid_o && (out_count_q == ({last_rom_param} - 1)));
 
 endmodule : binaryclass_NN
-`end_keywords
 '''
     return body
 
@@ -3790,7 +4201,8 @@ def generate_binaryclass_NN_top_from_template(
     content = _build_binaryclass_nn_sv_content(params, num_blocks)
     out_path = out_dir / "binaryclass_NN.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    desc = "Top-level Binary Classification Neural Network with AXI4-Stream\n                interfaces. The Slave interface receives data applied for\n                prediction, and the Master interface outputs the prediction result.\n                Implements three fully-connected layers with ReLU and Sigmoid."
+    out_path.write_text(_pyramidtech_wrap(content, "binaryclass_NN.sv", desc).rstrip() + "\n", encoding="utf-8")
     LOGGER.info(f"  Generated binaryclass_NN.sv (params from ONNX, {num_blocks} blocks)")
     return out_path
 
@@ -3804,16 +4216,13 @@ def generate_binaryclass_NN_wrapper_from_template(
     """Generate binaryclass_NN_wrapper.sv dynamically for any number of layers."""
     params = _compute_binaryclass_nn_params(linear_layers, weight_width, python_scale)
     num_blocks = (len(linear_layers) + 1) // 2
+    # Only pass the 9 structural params (match BinaryClass_last); scale params use binaryclass_NN defaults
     param_lines = []
     for b in range(1, num_blocks + 1):
         p = f"FC_{b}"
         param_lines.append(f"    .{p}_NEURONS    (FC{b}_NEURONS),")
         param_lines.append(f"    .{p}_INPUT_SIZE (FC{b}_INPUT_SIZE),")
-        param_lines.append(f"    .{p}_ROM_DEPTH  (FC{b}_ROM_DEPTH),")
-        param_lines.append(f"    .{p}_IN_LAYER_SCALE   ({params.get(f'{p}_IN_LAYER_SCALE', 8)}),")
-        param_lines.append(f"    .{p}_IN_BIAS_SCALE    ({params.get(f'{p}_IN_BIAS_SCALE', 0)}),")
-        param_lines.append(f"    .{p}_OUT_LAYER_SCALE  ({params.get(f'{p}_OUT_LAYER_SCALE', 8)}),")
-        param_lines.append(f"    .{p}_OUT_BIAS_SCALE   ({params.get(f'{p}_OUT_BIAS_SCALE', 0)})")
+        param_lines.append(f"    .{p}_ROM_DEPTH  (FC{b}_ROM_DEPTH)")
         if b < num_blocks:
             param_lines[-1] += ","
     wrapper_params_str = "\n".join(param_lines)
@@ -3825,19 +4234,20 @@ def generate_binaryclass_NN_wrapper_from_template(
         if b < num_blocks:
             wrapper_param_decls[-1] += ","
 
-    body = f'''`begin_keywords "1800-2012"
-module binaryclass_NN_wrapper 
+    body = f'''module binaryclass_NN_wrapper 
   import quant_pkg::*;
 #(
-{"".join(wrapper_param_decls)}
+{"\n".join(wrapper_param_decls)}
 )(
   input  logic clk_i,
   input  logic rst_n_i,
 
+  // AXI4-Stream Slave Interface: Data applied for prediction
   input  q_data_t s_axis_tdata_i,
   input  logic    s_axis_tvalid_i,
   input  logic    s_axis_tlast_i,
 
+  // AXI4-Stream Master Interface: Prediction result data
   output logic [DATA_WIDTH-1:0]       m_axis_prediction_tdata_o,
   output logic [KEEP_WIDTH-1:0]       m_axis_prediction_tkeep_o,
   output logic                        m_axis_prediction_tvalid_o,
@@ -3848,14 +4258,21 @@ module binaryclass_NN_wrapper
   timeunit 1ns;
   timeprecision 1ps;
 
+  // =========================================================================
+  // Instance of the Binary Classification Neural Network
+  // =========================================================================
   binaryclass_NN #(
 {wrapper_params_str}
   ) u_binaryclass_nn (
     .clk_i   (clk_i),
     .rst_n_i   (rst_n_i),
+
+    // Slave Port Connections
     .s_axis_tdata_i                  (s_axis_tdata_i),
     .s_axis_tvalid_i                 (s_axis_tvalid_i),
     .s_axis_tlast_i                  (s_axis_tlast_i),
+
+    // Master Port Connections
     .m_axis_prediction_tdata_o       (m_axis_prediction_tdata_o),
     .m_axis_prediction_tkeep_o       (m_axis_prediction_tkeep_o),
     .m_axis_prediction_tvalid_o      (m_axis_prediction_tvalid_o),
@@ -3864,11 +4281,11 @@ module binaryclass_NN_wrapper
   );
 
 endmodule : binaryclass_NN_wrapper
-`end_keywords
 '''
     out_path = out_dir / "binaryclass_NN_wrapper.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(body.rstrip() + "\n", encoding="utf-8")
+    desc = "Top-level wrapper module for the Binary Classification Neural Network.\n                Provides AXI4-Stream interfaces for prediction data and results."
+    out_path.write_text(_pyramidtech_wrap(body, "binaryclass_NN_wrapper.sv", desc).rstrip() + "\n", encoding="utf-8")
     LOGGER.info(f"  Generated binaryclass_NN_wrapper.sv")
     return out_path
 
@@ -3970,6 +4387,9 @@ def _generate_binaryclass_nn_rom(
   timeunit 1ns;
   timeprecision 1ps;
 
+  // ------------------------------------------------------------
+  // ROM memory
+  // ------------------------------------------------------------
   (* rom_style = "block" *)
   logic [WIDTH-1:0] mem [0:DEPTH-1];
 
@@ -3977,13 +4397,18 @@ def _generate_binaryclass_nn_rom(
     $readmemh("{mem_file}", mem);
   end
 
+  // ------------------------------------------------------------
+  // Read port
+  // ------------------------------------------------------------
   always_ff @(posedge clk_i) begin : read_port
     data_o <= mem[addr_i];
   end : read_port
 
 endmodule : {rom_name}
 """
-    (out_dir / f"{rom_name}.sv").write_text(_pyramidtech_wrap(body, f"{rom_name}.sv", f"ROM for {rom_name}"), encoding="utf-8")
+    rom_type = "biases" if "bias" in rom_name else "weights"
+    rom_desc = f"rom of {rom_type} of {base} layer"
+    (out_dir / f"{rom_name}.sv").write_text(_pyramidtech_wrap(body, f"{rom_name}.sv", rom_desc), encoding="utf-8")
 
 
 def _generate_fc_in_layer_binaryclass(out_dir: Path, input_sizes: List[int], weight_width: int, mem_dir: Path) -> None:
@@ -3993,14 +4418,25 @@ def _generate_fc_in_layer_binaryclass(out_dir: Path, input_sizes: List[int], wei
         prefix = _proj_prefix(b)
         cond = "if" if b == 0 else "else if"
         branches.append(f"""        {cond} (INPUT_SIZE == {in_sz}) begin
-            {prefix}_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
-            {prefix}_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
+            {prefix}_in_weights_rom #(
+                .DEPTH(INPUT_SIZE),
+                .WIDTH(NUM_NEURONS*Q_WIDTH)
+            ) weights_rom_inst (
+                .clk_i(clk_i),
+                .addr_i(weight_addr),
+                .data_o(weight_rom_row)
+            );
+            {prefix}_in_bias_rom #(
+                .DEPTH(1),
+                .WIDTH(NUM_NEURONS*Q_WIDTH*4)
+            ) bias_rom_inst (
+                .clk_i(clk_i),
+                .addr_i(1'b0),
+                .data_o(bias_rom_row)
+            );
         end""")
     gen_block = "\n".join(branches)
-    body = f"""`timescale 1ns/1ps
-import quant_pkg::*;
+    body = f"""import quant_pkg::*;
 
 module fc_in_layer #(
     parameter int NUM_NEURONS = 8,
@@ -4017,6 +4453,12 @@ module fc_in_layer #(
     output logic valid_o
 );
 
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Internal signals and registers
+  // ------------------------------------------------------------
     logic [$clog2(INPUT_SIZE)-1:0] weight_addr;
     logic [NUM_NEURONS*Q_WIDTH-1:0] weight_rom_row;
     logic [NUM_NEURONS*Q_WIDTH*4-1:0] bias_rom_row;
@@ -4025,6 +4467,9 @@ module fc_in_layer #(
     logic valid_i_q;
     q_data_t data_i_q;
 
+  // ------------------------------------------------------------
+  // Input stage registers
+  // ------------------------------------------------------------
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
             valid_i_q <= 1'b0;
@@ -4035,6 +4480,9 @@ module fc_in_layer #(
         end
     end
 
+  // ------------------------------------------------------------
+  // Address counter for sequential ROM access
+  // ------------------------------------------------------------
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i)
             weight_addr <= '0;
@@ -4042,11 +4490,17 @@ module fc_in_layer #(
             weight_addr <= (weight_addr == INPUT_SIZE-1) ? '0 : weight_addr + 1'b1;
     end
 
+  // ------------------------------------------------------------
+  // Weight and Bias ROM Instantiations
+  // ------------------------------------------------------------
     genvar n;
     generate
 {gen_block}
     endgenerate
 
+  // ------------------------------------------------------------
+  // ROM data unpacking
+  // ------------------------------------------------------------
     generate
         for (n = 0; n < NUM_NEURONS; n = n + 1) begin : SPLIT_ROM
             assign weights_rom_data[n] = weight_rom_row[n*Q_WIDTH +: Q_WIDTH];
@@ -4054,6 +4508,9 @@ module fc_in_layer #(
         end
     endgenerate
 
+  // ------------------------------------------------------------
+  // FC Compute Block Instance
+  // ------------------------------------------------------------
     fc_in #(
         .NUM_NEURONS(NUM_NEURONS),
         .INPUT_SIZE(INPUT_SIZE),
@@ -4072,7 +4529,8 @@ module fc_in_layer #(
 
 endmodule
 """
-    (out_dir / "fc_in_layer.sv").write_text(_pyramidtech_wrap(body, "fc_in_layer.sv", "FC input layer with ROM"), encoding="utf-8")
+    desc = "Fully-connected (FC) input layer with sequential ROM access.\n                Reads weights and biases from ROM and feeds the compute block."
+    (out_dir / "fc_in_layer.sv").write_text(_pyramidtech_wrap(body, "fc_in_layer.sv", desc), encoding="utf-8")
 
 
 def _generate_fc_out_layer_binaryclass(out_dir: Path, rom_depths: List[int], weight_width: int, mem_dir: Path) -> None:
@@ -4084,14 +4542,25 @@ def _generate_fc_out_layer_binaryclass(out_dir: Path, rom_depths: List[int], wei
         addr_arg = "1'b0" if rom_d <= 1 else "weights_rom_addr"
         bias_addr = "1'b0" if rom_d <= 1 else "bias_rom_addr"
         branches.append(f"""        {cond} (ROM_DEPTH == {rom_d}) begin
-            {prefix}_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i({addr_arg}), .data_o(weights_rom_data_raw));
-            {prefix}_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i({bias_addr}), .data_o(bias_rom_data));
+            {prefix}_out_weights_rom #(
+                .DEPTH(ROM_DEPTH),
+                .WIDTH(NUM_NEURONS*Q_WIDTH)
+            ) weights_rom_inst (
+                .clk_i(clk_i),
+                .addr_i({addr_arg}),
+                .data_o(weights_rom_data_raw)
+            );
+            {prefix}_out_bias_rom #(
+                .DEPTH(ROM_DEPTH),
+                .WIDTH(Q_WIDTH*4)
+            ) bias_rom_inst (
+                .clk_i(clk_i),
+                .addr_i({bias_addr}),
+                .data_o(bias_rom_data)
+            );
         end""")
     gen_block = "\n".join(branches)
-    body = f"""`timescale 1ns/1ps
-import quant_pkg::*;
+    body = f"""import quant_pkg::*;
 
 module fc_out_layer #(
     parameter int NUM_NEURONS = 2,
@@ -4108,6 +4577,12 @@ module fc_out_layer #(
     output logic valid_o
 );
 
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  // ------------------------------------------------------------
+  // Counters and flags
+  // ------------------------------------------------------------
     logic [$clog2(ROM_DEPTH)-1:0] addr_cnt;
     logic addr_last;
     logic valid_pipeline;
@@ -4123,6 +4598,9 @@ module fc_out_layer #(
     acc_t bias_rom_data_reg;
     q_data_t data_i_reg[NUM_NEURONS];
 
+  // ------------------------------------------------------------
+  // Address counter
+  // ------------------------------------------------------------
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i)
             addr_cnt <= '0;
@@ -4132,6 +4610,9 @@ module fc_out_layer #(
 
     assign addr_last = (addr_cnt == ROM_DEPTH-1);
 
+  // ------------------------------------------------------------
+  // Valid pipeline
+  // ------------------------------------------------------------
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i)
             valid_pipeline <= 1'b0;
@@ -4155,10 +4636,16 @@ module fc_out_layer #(
     assign weights_rom_addr = addr_cnt;
     assign bias_rom_addr    = addr_cnt;
 
+  // ------------------------------------------------------------
+  // Weight and Bias ROM Instantiations
+  // ------------------------------------------------------------
     generate
 {gen_block}
     endgenerate
 
+  // ------------------------------------------------------------
+  // Register ROM outputs and data_i
+  // ------------------------------------------------------------
     genvar i;
     generate
         for (i = 0; i < NUM_NEURONS; i = i + 1) begin : SPLIT_WEIGHTS
@@ -4183,6 +4670,9 @@ module fc_out_layer #(
         end
     end
 
+  // ------------------------------------------------------------
+  // FC Compute Block Instance
+  // ------------------------------------------------------------
     fc_out #(
         .NUM_NEURONS(NUM_NEURONS),
         .LAYER_SCALE(LAYER_SCALE),
@@ -4200,7 +4690,8 @@ module fc_out_layer #(
 
 endmodule
 """
-    (out_dir / "fc_out_layer.sv").write_text(_pyramidtech_wrap(body, "fc_out_layer.sv", "FC output layer with ROM"), encoding="utf-8")
+    desc = "Fully-connected output layer with sequential ROM access.\n                Reads weights and biases from ROM and feeds the fc_out compute block."
+    (out_dir / "fc_out_layer.sv").write_text(_pyramidtech_wrap(body, "fc_out_layer.sv", desc, author="AA"), encoding="utf-8")
 
 
 def _generate_binaryclass_NN(
@@ -4210,8 +4701,7 @@ def _generate_binaryclass_NN(
     fc1_rom: int, fc2_rom: int, fc3_rom: int,
 ) -> None:
     """Generate binaryclass_NN.sv with AXI4-Stream ports matching reference."""
-    body = f"""`timescale 1ns/1ps
-import quant_pkg::*;
+    body = f"""import quant_pkg::*;
 
 module binaryclass_NN #(
     parameter int FC1_NEURONS    = {fc1_n},
@@ -4235,6 +4725,9 @@ module binaryclass_NN #(
     output logic    prediction_valid,
     output logic    prediction_tlast
 );
+
+  timeunit 1ns;
+  timeprecision 1ps;
 
     q_data_t fc1_out[FC1_NEURONS];
     logic    fc1_layer_valid_out;
@@ -4362,7 +4855,8 @@ module binaryclass_NN #(
 
 endmodule
 """
-    (out_dir / "binaryclass_NN.sv").write_text(_pyramidtech_wrap(body, "binaryclass_NN.sv", "Top-level binary classification NN with AXI4-Stream"), encoding="utf-8")
+    desc = "Top-level Binary Classification Neural Network with AXI4-Stream\n                interfaces. The Slave interface receives data applied for\n                prediction, and the Master interface outputs the prediction result.\n                Implements three fully-connected layers with ReLU and Sigmoid."
+    (out_dir / "binaryclass_NN.sv").write_text(_pyramidtech_wrap(body, "binaryclass_NN.sv", desc), encoding="utf-8")
 
 
 def _generate_binaryclass_NN_wrapper(
@@ -4372,8 +4866,7 @@ def _generate_binaryclass_NN_wrapper(
     fc1_rom: int, fc2_rom: int, fc3_rom: int,
 ) -> None:
     """Generate binaryclass_NN_wrapper.sv - adapts AXI-style ports to binaryclass_NN."""
-    body = f"""`timescale 1ns/1ps
-import quant_pkg::*;
+    body = f"""import quant_pkg::*;
 
 module binaryclass_NN_wrapper #(
     parameter int FC1_NEURONS    = {fc1_n},
@@ -4400,6 +4893,9 @@ module binaryclass_NN_wrapper #(
     output logic        m_axis_prediction_tlast_o
 );
 
+  timeunit 1ns;
+  timeprecision 1ps;
+
     q_data_t prediction;
 
     binaryclass_NN #(
@@ -4422,7 +4918,8 @@ module binaryclass_NN_wrapper #(
 
 endmodule
 """
-    (out_dir / "binaryclass_NN_wrapper.sv").write_text(_pyramidtech_wrap(body, "binaryclass_NN_wrapper.sv", "Wrapper for binaryclass_NN"), encoding="utf-8")
+    desc = "Top-level wrapper module for the Binary Classification Neural Network.\n                Provides AXI4-Stream interfaces for prediction data and results."
+    (out_dir / "binaryclass_NN_wrapper.sv").write_text(_pyramidtech_wrap(body, "binaryclass_NN_wrapper.sv", desc), encoding="utf-8")
 
 
 def generate_rtl_filelist(
