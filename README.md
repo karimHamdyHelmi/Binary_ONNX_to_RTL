@@ -17,9 +17,6 @@ Output format is **binaryclass** (binaryclass_NN module, AXI4-Stream, fc_in/fc_o
 # Convert binary classifier ONNX to RTL + .mem (quantization auto-detected)
 python binary_onnx_to_rtl.py --onnx-model path/to/model.onnx --out-dir ./my_ip
 
-# With testbench
-python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --emit-testbench
-
 # Override quantization
 python binary_onnx_to_rtl.py --onnx-model model.onnx --out-dir ./output --weight-format int8
 

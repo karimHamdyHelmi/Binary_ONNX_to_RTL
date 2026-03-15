@@ -610,11 +610,6 @@ def main() -> int:
         help="Data width in bits (default: 16)",
     )
     parser.add_argument(
-        "--emit-testbench",
-        action="store_true",
-        help="Generate testbench",
-    )
-    parser.add_argument(
         "--emit-rtl-legacy",
         action="store_true",
         help="Also emit legacy rtl/ flow outputs",
@@ -795,7 +790,6 @@ def main() -> int:
         generate_axi4_stream_wrapper,
         generate_flattened_top_module,
         generate_wrapper_module,
-        generate_testbench,
         generate_mapping_report,
         generate_netlist_json,
         generate_rtl_filelist,
@@ -833,8 +827,6 @@ def main() -> int:
     sv_dir.mkdir(parents=True, exist_ok=True)
     mem_dir = out_dir / "mem_files"
     mem_dir.mkdir(parents=True, exist_ok=True)
-    tb_sim_dir = out_dir / "tb" / "sim"
-    tb_sim_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 5: Generate .mem files (binaryclass_nn format: mem_files/fc1_weights.mem)
     LOGGER.info(f"Writing .mem files (int{weight_format_bits})...")
