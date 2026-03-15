@@ -646,12 +646,6 @@ def main() -> int:
         help="Use binaryclass_nn style (fc_in->fc_out->relu, sigmoid at end). Default: True.",
     )
     parser.add_argument(
-        "--binaryclass-format",
-        action="store_true",
-        help="Use fixed 3-block binaryclass_NN template (only for 3 or 6 FC layers). "
-        "By default, hierarchical format supports any number of layers.",
-    )
-    parser.add_argument(
         "--inspect",
         action="store_true",
         help="Print ONNX graph structure (node types, inputs) and exit",
@@ -875,100 +869,13 @@ def main() -> int:
 
     model_name = onnx_path.stem
     linear_layers = [l for l in layers if l.layer_type == "linear"]
-    # binaryclass_nn format: fixed 3-block template, only when --binaryclass-format and 3 or 6 layers
-    # By default: hierarchical format supports any number of layers
-    use_binaryclass_nn = (
-        args.binaryclass_format
-        and len(linear_layers) in (3, 6)
-        and all(l.name == f"fc{i+1}" for i, l in enumerate(linear_layers))
-    )
-    use_flattened = args.rtl_structure == "flattened" and not use_binaryclass_nn
-
-    if use_binaryclass_nn:
-        LOGGER.info("Generating binaryclass_nn format (binaryclass_NN, AXI4-Stream, reference structure)...")
-        emit_binaryclass_nn_format(out_dir, layers, input_size, weight_format_bits, args.scale)
-        generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, 8, final_activation=final_activation)
-        generate_netlist_json(out_dir, model_name, layers, final_activation=final_activation)
-        generate_rtl_filelist(out_dir, model_name, layers, binaryclass_nn_format=True)
-        LOGGER.info(f"Binaryclass_nn format RTL generation complete! Output: {out_dir}")
-        return 0
-
-    if use_flattened and len(linear_layers) < 3:
-        LOGGER.warning(
-            f"Flattened RTL requires at least 3 FC layers; found {len(linear_layers)}. "
-            "Falling back to hierarchical structure."
-        )
-        use_flattened = False
-
-    # Step 7: Write embedded RTL templates (quant_pkg always needed; submodules only for hierarchical)
-    LOGGER.info("Writing RTL templates...")
-    write_embedded_rtl_templates(sv_dir, weight_format_bits, write_submodules=not use_flattened)
-
-    if use_flattened:
-        # 8a. Flattened: single inlined top module + wrapper (no separate ROM/layer modules)
-        LOGGER.info("Generating flattened RTL structure...")
-        generate_flattened_top_module(
-            model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir
-        )
-        generate_wrapper_module(model_name, layers, weight_format_bits, sv_dir)
-    else:
-        # 8b. Hierarchical: ROM, layer, and top modules
-        LOGGER.info("Generating hierarchical RTL structure...")
-        if args.parameterized_layers:
-            LOGGER.info("  Using parameterized fc_in_layer / fc_out_layer...")
-            # binaryclass_nn layout: .mem in out_dir root, ROM $readmemh uses simple filename
-            generate_proj_mem_files(layers, out_dir, args.scale, weight_format_bits)
-            generate_proj_roms(layers, weight_format_bits, sv_dir, out_dir, mem_path_prefix="")
-            generate_fc_in_layer_parameterized(layers, weight_format_bits, sv_dir)
-            generate_fc_out_layer_parameterized(layers, weight_format_bits, sv_dir)
-            generate_top_module(
-                model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir,
-                use_parameterized_layers=True,
-                use_binaryclass_nn_style=args.binaryclass_nn_style,
-                final_activation=final_activation,
-                python_scale=args.scale,
-            )
-            generate_axi4_stream_wrapper(model_name, layers, weight_format_bits, sv_dir)
-        else:
-            for layer in layers:
-                if layer.layer_type == "linear":
-                    generate_weight_rom(layer.name, layer.in_features or 0, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
-                    generate_bias_rom(layer.name, layer.out_features or 0, weight_format_bits, sv_dir, mem_subdir="mem_files")
-                    if layer.name == "fc1":
-                        generate_fc_layer_wrapper(
-                            layer.name, layer.in_features or 0, layer.out_features or 0,
-                            args.data_width, weight_format_bits, sv_dir,
-                        )
-                    else:
-                        generate_fc_out_layer(
-                            layer.name, layer.out_features or 0, layer.in_features or 0, sv_dir,
-                        )
-
-            LOGGER.info("Generating top module...")
-            generate_top_module(
-                model_name, layers, input_size, args.data_width, weight_format_bits, sv_dir,
-                use_parameterized_layers=False,
-                final_activation=final_activation,
-                python_scale=args.scale,
-            )
-            generate_axi4_stream_wrapper(model_name, layers, weight_format_bits, sv_dir)
-
-    # Step 8: Testbench (optional)
-    if args.emit_testbench:
-        last_fc = next((l for l in reversed(layers) if l.layer_type == "linear"), None)
-        if last_fc:
-            generate_testbench(model_name, input_size, last_fc.out_features or 0, weight_format_bits, tb_sim_dir)
-
-    # Step 9: Reports (mapping report, netlist JSON, RTL filelist)
-    frac_bits = 8
-    generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, frac_bits, final_activation=final_activation)
+    # Binaryclass format is the only output format; supports any number of FC layers
+    LOGGER.info("Generating binaryclass format (binaryclass_NN, AXI4-Stream)...")
+    emit_binaryclass_nn_format(out_dir, layers, input_size, weight_format_bits, args.scale)
+    generate_mapping_report(out_dir, model_name, layers, args.scale, args.data_width, weight_format_bits, 32, 8, final_activation=final_activation)
     generate_netlist_json(out_dir, model_name, layers, final_activation=final_activation)
-    generate_rtl_filelist(
-        out_dir, model_name, layers,
-        parameterized_layers=(not use_flattened and args.parameterized_layers),
-    )
-
-    LOGGER.info(f"Binary classifier RTL generation complete! Output: {out_dir}")
+    generate_rtl_filelist(out_dir, model_name, layers, binaryclass_nn_format=True)
+    LOGGER.info(f"Binaryclass RTL generation complete! Output: {out_dir}")
     return 0
 
 

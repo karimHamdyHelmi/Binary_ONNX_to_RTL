@@ -267,14 +267,17 @@ def generate_proj_mem_files(
     six_layer_blocks: bool = False,
 ) -> None:
     """Generate .mem files with fc_N_proj_in/out naming (binaryclass_nn style per layer block).
-    When binaryclass_nn_layout=True: write to mem_dir root, one proj_in + proj_out per layer block.
-    When six_layer_blocks=True and 6 layers: iterate over 3 blocks (fc1+fc2, fc3+fc4, fc5+fc6)."""
+    Pairs layers consecutively: block 0=(fc1,fc2), block 1=(fc3,fc4), ... For odd N, last block=(fcN, 1x1).
+    six_layer_blocks is deprecated; pairing is now automatic for any N."""
     linear_layers = [l for l in layers if l.layer_type == "linear"]
     mem_dir.mkdir(parents=True, exist_ok=True)
-    if six_layer_blocks and len(linear_layers) == 6:
-        block_indices = [(0, 1), (2, 3), (4, 5)]
-    else:
-        block_indices = [(i, i + 1) if i + 1 < len(linear_layers) else (i, None) for i in range(len(linear_layers))]
+    # Pair consecutively: (fc1,fc2), (fc3,fc4), ...; odd N: last block has (fcN, None) -> 1x1 proj_out
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
+    block_indices = [
+        (2 * b, 2 * b + 1) if 2 * b + 1 < n else (2 * b, None)
+        for b in range(num_blocks)
+    ]
     for block_idx, (layer_idx, next_idx) in enumerate(block_indices):
         layer = linear_layers[layer_idx]
         next_layer = linear_layers[next_idx] if next_idx is not None else None
@@ -3372,28 +3375,21 @@ def generate_mapping_report(
     if final_activation:
         lines.append(f"Final Activation (from ONNX): {final_activation}")
     lines.append("")
-    # Add computed LAYER_SCALE and BIAS_SCALE
+    # Add computed LAYER_SCALE and BIAS_SCALE for binaryclass format
     linear_layers = [l for l in layers if l.layer_type == "linear"]
-    if len(linear_layers) in (3, 6):
+    if linear_layers:
         try:
             scales = compute_layer_scales_for_binaryclass(linear_layers, weight_width, scale)
-            lines.append("Computed LAYER_SCALE (from dimensions + ONNX quant params):")
-            for k in ["FC_1_IN_LAYER_SCALE", "FC_1_OUT_LAYER_SCALE", "FC_2_IN_LAYER_SCALE", "FC_2_OUT_LAYER_SCALE", "FC_3_IN_LAYER_SCALE", "FC_3_OUT_LAYER_SCALE"]:
-                if k in scales:
+            layer_scale_keys = sorted(k for k in scales if "LAYER_SCALE" in k)
+            bias_scale_keys = sorted(k for k in scales if "BIAS_SCALE" in k)
+            if layer_scale_keys:
+                lines.append("Computed LAYER_SCALE (from dimensions + ONNX quant params):")
+                for k in layer_scale_keys:
                     lines.append(f"  {k}: {scales[k]}")
-            lines.append("Computed BIAS_SCALE (from accumulator/bias alignment):")
-            for k in ["FC_1_IN_BIAS_SCALE", "FC_1_OUT_BIAS_SCALE", "FC_2_IN_BIAS_SCALE", "FC_2_OUT_BIAS_SCALE", "FC_3_IN_BIAS_SCALE", "FC_3_OUT_BIAS_SCALE"]:
-                if k in scales:
+            if bias_scale_keys:
+                lines.append("Computed BIAS_SCALE (from accumulator/bias alignment):")
+                for k in bias_scale_keys:
                     lines.append(f"  {k}: {scales[k]}")
-            lines.append("")
-        except Exception:
-            pass
-    elif linear_layers:
-        try:
-            per_layer = compute_layer_scales_for_hierarchical(linear_layers, weight_width, scale)
-            lines.append("Computed LAYER_SCALE and BIAS_SCALE (per layer, hierarchical):")
-            for s in per_layer:
-                lines.append(f"  {s['layer']}: LAYER_SCALE in={s['in_layer_scale']} out={s['out_layer_scale']}, BIAS_SCALE in={s['in_bias_scale']} out={s['out_bias_scale']}")
             lines.append("")
         except Exception:
             pass
@@ -3528,93 +3524,38 @@ def compute_layer_scales_for_binaryclass(
     weight_width: int,
     python_scale: int = 256,
 ) -> Dict[str, int]:
-    """Compute LAYER_SCALE and BIAS_SCALE for each binaryclass block (3 or 6 layers -> 3 blocks).
+    """Compute LAYER_SCALE and BIAS_SCALE for each binaryclass block.
+    Pairs layers consecutively: block b = (fc_{2b+1}, fc_{2b+2}); odd N: last block has (fcN, 1x1).
+    IN layers use ONNX weight_scale when available; OUT layers use python_scale only."""
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
+    result: Dict[str, int] = {}
 
-    Block structure (6layer case):
-      Block 1: fc1 (IN) + fc2 (OUT)  -> FC_1_IN_*, FC_1_OUT_*
-      Block 2: fc3 (IN) + fc4 (OUT)  -> FC_2_IN_*, FC_2_OUT_*
-      Block 3: fc5 (IN) + fc6 (OUT)  -> FC_3_IN_*, FC_3_OUT_*
-
-    IN layers (fc_proj_in): use ONNX weight_scale when available (MatMulInteger path)
-    OUT layers (fc_proj_out): typically no weight_scale in ONNX; use python_scale only"""
-    if len(linear_layers) == 3:
-        fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
-        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-        fc2_in, fc2_out = fc2.in_features or 0, fc2.out_features or 0
-        fc3_in, fc3_out = fc3.in_features or 0, fc3.out_features or 0
-        fc1_rom = fc2.out_features or 0
-        fc2_rom = fc3.out_features or 0
-        fc3_rom = 1
-    elif len(linear_layers) == 6:
-        fc1, fc3, fc5 = linear_layers[0], linear_layers[2], linear_layers[4]
-        fc2, fc4, fc6 = linear_layers[1], linear_layers[3], linear_layers[5]
-        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0
-        fc3_in, fc3_out = fc5.in_features or 0, fc5.out_features or 0
-        fc1_rom = fc2.out_features or 0
-        fc2_rom = fc4.out_features or 0
-        fc3_rom = fc6.out_features or 1
-    else:
-        raise RuntimeError(f"binaryclass_nn requires 3 or 6 FC layers; found {len(linear_layers)}")
-
-    # Get weight_scale from ONNX quant_params (MatMulInteger, QLinearMatMul) for IN layers
     def _ws(layer: LayerInfo) -> Optional[float]:
         if layer.quant_params and "weight_scale" in layer.quant_params:
             return layer.quant_params["weight_scale"]
         if layer.quant_params and "b_scale" in layer.quant_params:
             return layer.quant_params["b_scale"]
         return None
-    w1 = _ws(fc1)
-    w2 = _ws(fc3) if len(linear_layers) >= 4 else _ws(fc2)
-    w3 = _ws(fc5) if len(linear_layers) == 6 else _ws(fc3)
 
-    return {
-        # Block 1: IN uses weight_scale from fc1; OUT uses fc2 output dim (fc1_rom)
-        "FC_1_IN_LAYER_SCALE": compute_layer_scale(weight_width, fc1_in, w1, python_scale),
-        "FC_1_IN_BIAS_SCALE": compute_bias_scale(weight_width, fc1_in, python_scale),
-        "FC_1_OUT_LAYER_SCALE": compute_layer_scale(weight_width, fc1_rom, None, python_scale),
-        "FC_1_OUT_BIAS_SCALE": compute_bias_scale(weight_width, fc1_rom, python_scale),
-        # Block 2: IN uses weight_scale from fc3; OUT uses fc4 output dim (fc2_rom)
-        "FC_2_IN_LAYER_SCALE": compute_layer_scale(weight_width, fc2_in, w2, python_scale),
-        "FC_2_IN_BIAS_SCALE": compute_bias_scale(weight_width, fc2_in, python_scale),
-        "FC_2_OUT_LAYER_SCALE": compute_layer_scale(weight_width, fc2_rom, None, python_scale),
-        "FC_2_OUT_BIAS_SCALE": compute_bias_scale(weight_width, fc2_rom, python_scale),
-        # Block 3: IN uses weight_scale from fc5; OUT uses fc6 output dim (fc3_rom, usually 1)
-        "FC_3_IN_LAYER_SCALE": compute_layer_scale(weight_width, fc3_in, w3, python_scale),
-        "FC_3_IN_BIAS_SCALE": compute_bias_scale(weight_width, fc3_in, python_scale),
-        "FC_3_OUT_LAYER_SCALE": compute_layer_scale(weight_width, fc3_rom, None, python_scale),
-        "FC_3_OUT_BIAS_SCALE": compute_bias_scale(weight_width, fc3_rom, python_scale),
-    }
-
-
-def compute_layer_scales_for_hierarchical(
-    linear_layers: List[LayerInfo],
-    weight_width: int,
-    python_scale: int = 256,
-) -> List[Dict[str, int]]:
-    """Compute LAYER_SCALE and BIAS_SCALE per FC layer for hierarchical format (any N layers).
-    Returns list of dicts: [{"layer": name, "in_layer_scale", "in_bias_scale", "out_layer_scale", "out_bias_scale"}, ...]
-    Each layer has fc_in (input_size=in_features) and fc_out (rom_depth=next_layer.in_features or 1)."""
-    result: List[Dict[str, int]] = []
-    for idx, layer in enumerate(linear_layers):
-        in_f = layer.in_features or 0
-        next_in = (
-            linear_layers[idx + 1].in_features or 1
-            if idx + 1 < len(linear_layers)
-            else 1
+    for b in range(num_blocks):
+        in_idx = 2 * b
+        out_idx = 2 * b + 1 if 2 * b + 1 < n else None
+        in_layer = linear_layers[in_idx]
+        out_layer = linear_layers[out_idx] if out_idx is not None else None
+        in_f = in_layer.in_features or 0
+        in_out = in_layer.out_features or 0
+        rom_depth = (out_layer.out_features or 1) if out_layer else 1
+        prefix = f"FC_{b + 1}"
+        result[f"{prefix}_IN_LAYER_SCALE"] = compute_layer_scale(
+            weight_width, in_f, _ws(in_layer), python_scale
         )
-        ws = None
-        if layer.quant_params and "weight_scale" in layer.quant_params:
-            ws = layer.quant_params["weight_scale"]
-        elif layer.quant_params and "b_scale" in layer.quant_params:
-            ws = layer.quant_params["b_scale"]
-        result.append({
-            "layer": layer.name,
-            "in_layer_scale": compute_layer_scale(weight_width, in_f, ws, python_scale),
-            "in_bias_scale": compute_bias_scale(weight_width, in_f, python_scale),
-            "out_layer_scale": compute_layer_scale(weight_width, next_in, None, python_scale),
-            "out_bias_scale": compute_bias_scale(weight_width, next_in, python_scale),
-        })
+        result[f"{prefix}_IN_BIAS_SCALE"] = compute_bias_scale(weight_width, in_f, python_scale)
+        result[f"{prefix}_OUT_LAYER_SCALE"] = compute_layer_scale(
+            weight_width, rom_depth, None, python_scale
+        )
+        result[f"{prefix}_OUT_BIAS_SCALE"] = compute_bias_scale(weight_width, rom_depth, python_scale)
+
     return result
 
 
@@ -3624,56 +3565,217 @@ def compute_layer_scales_for_hierarchical(
 
 def _compute_binaryclass_nn_params(linear_layers: List[LayerInfo], weight_width: int = 8, python_scale: int = 256) -> dict:
     """Compute binaryclass_NN parameters from ONNX layers.
-    Supports 3 layers (fc1,fc2,fc3) or 6 layers (fc1..fc6) paired into 3 blocks.
-    Block 1: fc_proj_in (fc1) + fc_proj_out (fc2); Block 2: fc_2_proj_in (fc3) + fc_2_proj_out (fc4);
-    Block 3: fc_3_proj_in (fc5) + fc_3_proj_out (fc6). For 3 layers: fc4,fc5,fc6 are derived.
-    LAYER_SCALE and BIAS_SCALE are computed from dimensions and ONNX quant params."""
-    if len(linear_layers) == 3:
-        fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
-        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0  # block 2 = fc3
-        fc3_in, fc3_out = fc3.out_features or 1, 1  # block 3: receives fc3 output (1 value)
-        fc1_rom = fc2.out_features or 0
-        fc2_rom = fc3.out_features or 0
-        fc3_rom = 1
-    elif len(linear_layers) == 6:
-        fc1, fc3, fc5 = linear_layers[0], linear_layers[2], linear_layers[4]
-        fc2, fc4, fc6 = linear_layers[1], linear_layers[3], linear_layers[5]
-        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0
-        fc3_in, fc3_out = fc5.in_features or 0, fc5.out_features or 0
-        fc1_rom = fc2.out_features or 0
-        fc2_rom = fc4.out_features or 0
-        fc3_rom = fc6.out_features or 1
-    else:
-        raise RuntimeError(
-            f"binaryclass_nn format requires 3 or 6 FC layers; found {len(linear_layers)}."
-        )
+    Pairs layers consecutively: block b = (fc_{2b+1}, fc_{2b+2}); odd N: last block has (fcN, 1x1).
+    Returns dict with FC_1_*, FC_2_*, ... for num_blocks = ceil(N/2)."""
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
     scales = compute_layer_scales_for_binaryclass(linear_layers, weight_width, python_scale)
-    return {
-        "FC_1_NEURONS": fc1_out,
-        "FC_2_NEURONS": fc2_out,
-        "FC_3_NEURONS": fc3_out,
-        "FC_1_INPUT_SIZE": fc1_in,
-        "FC_2_INPUT_SIZE": fc2_in,
-        "FC_3_INPUT_SIZE": fc3_in,
-        "FC_1_ROM_DEPTH": fc1_rom,
-        "FC_2_ROM_DEPTH": fc2_rom,
-        "FC_3_ROM_DEPTH": fc3_rom,
-        "FC_1_IN_LAYER_SCALE": scales["FC_1_IN_LAYER_SCALE"],
-        "FC_1_IN_BIAS_SCALE": scales["FC_1_IN_BIAS_SCALE"],
-        "FC_1_OUT_LAYER_SCALE": scales["FC_1_OUT_LAYER_SCALE"],
-        "FC_1_OUT_BIAS_SCALE": scales["FC_1_OUT_BIAS_SCALE"],
-        "FC_2_IN_LAYER_SCALE": scales["FC_2_IN_LAYER_SCALE"],
-        "FC_2_IN_BIAS_SCALE": scales["FC_2_IN_BIAS_SCALE"],
-        "FC_2_OUT_LAYER_SCALE": scales["FC_2_OUT_LAYER_SCALE"],
-        "FC_2_OUT_BIAS_SCALE": scales["FC_2_OUT_BIAS_SCALE"],
-        "FC_3_IN_LAYER_SCALE": scales["FC_3_IN_LAYER_SCALE"],
-        "FC_3_IN_BIAS_SCALE": scales["FC_3_IN_BIAS_SCALE"],
-        "FC_3_OUT_LAYER_SCALE": scales["FC_3_OUT_LAYER_SCALE"],
-        "FC_3_OUT_BIAS_SCALE": scales["FC_3_OUT_BIAS_SCALE"],
-        "FIFO_DEPTH": 1024,
-    }
+    result: Dict[str, Any] = {"FIFO_DEPTH": 1024}
+    for b in range(num_blocks):
+        in_idx = 2 * b
+        out_idx = 2 * b + 1 if 2 * b + 1 < n else None
+        in_layer = linear_layers[in_idx]
+        out_layer = linear_layers[out_idx] if out_idx is not None else None
+        in_f = in_layer.in_features or 0
+        in_out = in_layer.out_features or 0
+        rom_depth = (out_layer.out_features or 1) if out_layer else 1
+        prefix = f"FC_{b + 1}"
+        result[f"{prefix}_NEURONS"] = in_out
+        result[f"{prefix}_INPUT_SIZE"] = in_f
+        result[f"{prefix}_ROM_DEPTH"] = rom_depth
+        result[f"{prefix}_IN_LAYER_SCALE"] = scales[f"{prefix}_IN_LAYER_SCALE"]
+        result[f"{prefix}_IN_BIAS_SCALE"] = scales[f"{prefix}_IN_BIAS_SCALE"]
+        result[f"{prefix}_OUT_LAYER_SCALE"] = scales[f"{prefix}_OUT_LAYER_SCALE"]
+        result[f"{prefix}_OUT_BIAS_SCALE"] = scales[f"{prefix}_OUT_BIAS_SCALE"]
+    return result
+
+
+def _build_binaryclass_nn_sv_content(params: Dict[str, Any], num_blocks: int) -> str:
+    """Build binaryclass_NN.sv module content for num_blocks (dynamic generation)."""
+    param_lines = []
+    for b in range(1, num_blocks + 1):
+        p = f"FC_{b}"
+        param_lines.append(f"  parameter int {p}_NEURONS          = 32'd{params.get(f'{p}_NEURONS', 1)},")
+        param_lines.append(f"  parameter int {p}_INPUT_SIZE       = 32'd{params.get(f'{p}_INPUT_SIZE', 1)},")
+        param_lines.append(f"  parameter int {p}_ROM_DEPTH        = 32'd{params.get(f'{p}_ROM_DEPTH', 1)},")
+        param_lines.append(f"  parameter int {p}_IN_LAYER_SCALE   = 32'd{params.get(f'{p}_IN_LAYER_SCALE', 8)},")
+        param_lines.append(f"  parameter int {p}_IN_BIAS_SCALE    = 32'd{params.get(f'{p}_IN_BIAS_SCALE', 0)},")
+        param_lines.append(f"  parameter int {p}_OUT_LAYER_SCALE  = 32'd{params.get(f'{p}_OUT_LAYER_SCALE', 8)},")
+        param_lines.append(f"  parameter int {p}_OUT_BIAS_SCALE   = 32'd{params.get(f'{p}_OUT_BIAS_SCALE', 0)},")
+    param_lines.append(f"  parameter int FIFO_DEPTH            = 32'd{params.get('FIFO_DEPTH', 1024)}")
+    param_str = "\n".join(param_lines)
+
+    last_rom = params.get(f"FC_{num_blocks}_ROM_DEPTH", 1)
+    sig_lines = []
+    block_inst = []
+    prev_valid = "s_axis_tvalid_i"
+    prev_data = "s_axis_tdata_i"
+
+    for b in range(1, num_blocks + 1):
+        p = f"FC_{b}"
+        neurons = params.get(f"{p}_NEURONS", 1)
+        is_last = b == num_blocks
+        sig_lines.append(f"  // Block {b} signals")
+        sig_lines.append(f"  q_data_t fc{b}_out_s[{neurons}];")
+        sig_lines.append(f"  logic    fc{b}_valid_s;")
+        sig_lines.append(f"  q_data_t fc{b}_pre_act_s;")
+        if not is_last:
+            sig_lines.append(f"  q_data_t fc{b}_post_relu_s;")
+            sig_lines.append(f"  logic    relu{b}_valid_i_s;")
+            sig_lines.append(f"  logic    relu{b}_valid_o_s;")
+        else:
+            sig_lines.append(f"  logic    sigmoid_valid_i_s;")
+            sig_lines.append(f"  logic    sigmoid_valid_o_s;")
+            sig_lines.append(f"  q_data_t sigmoid_data_s;")
+            sig_lines.append(f"  q_data_t logits_s;")
+        sig_lines.append("")
+
+        block_inst.append(f"  // Block {b}: fc_in + fc_out + activation")
+        block_inst.append(f"  fc_in_layer #(")
+        block_inst.append(f"    .NUM_NEURONS ({p}_NEURONS),")
+        block_inst.append(f"    .INPUT_SIZE  ({p}_INPUT_SIZE),")
+        block_inst.append(f"    .BIAS_SCALE  ({p}_IN_BIAS_SCALE),")
+        block_inst.append(f"    .LAYER_SCALE ({p}_IN_LAYER_SCALE)")
+        block_inst.append(f"  ) u_fc{b}_in_layer (")
+        block_inst.append(f"    .clk_i   (clk_i),")
+        block_inst.append(f"    .rst_n_i   (rst_n_i),")
+        block_inst.append(f"    .valid_i ({prev_valid}),")
+        block_inst.append(f"    .data_i  ({prev_data}),")
+        block_inst.append(f"    .data_o  (fc{b}_out_s),")
+        block_inst.append(f"    .valid_o (fc{b}_valid_s)")
+        block_inst.append(f"  );")
+        block_inst.append(f"  fc_out_layer #(")
+        block_inst.append(f"    .NUM_NEURONS ({p}_NEURONS),")
+        block_inst.append(f"    .ROM_DEPTH   ({p}_ROM_DEPTH),")
+        block_inst.append(f"    .BIAS_SCALE  ({p}_OUT_BIAS_SCALE),")
+        block_inst.append(f"    .LAYER_SCALE ({p}_OUT_LAYER_SCALE)")
+        block_inst.append(f"  ) u_fc{b}_out_layer (")
+        block_inst.append(f"    .clk_i   (clk_i),")
+        block_inst.append(f"    .rst_n_i   (rst_n_i),")
+        block_inst.append(f"    .valid_i (fc{b}_valid_s),")
+        block_inst.append(f"    .data_i  (fc{b}_out_s),")
+        block_inst.append(f"    .data_o  (fc{b}_pre_act_s),")
+        block_inst.append(f"    .valid_o (relu{b}_valid_i_s)" if not is_last else f"    .valid_o (sigmoid_valid_i_s)")
+        block_inst.append(f"  );")
+        if not is_last:
+            block_inst.append(f"  relu_layer u_relu{b} (")
+            block_inst.append(f"    .clk_i   (clk_i),")
+            block_inst.append(f"    .rst_n_i   (rst_n_i),")
+            block_inst.append(f"    .valid_i (relu{b}_valid_i_s),")
+            block_inst.append(f"    .data_i  (fc{b}_pre_act_s),")
+            block_inst.append(f"    .data_o  (fc{b}_post_relu_s),")
+            block_inst.append(f"    .valid_o (relu{b}_valid_o_s)")
+            block_inst.append(f"  );")
+            prev_valid = f"relu{b}_valid_o_s"
+            prev_data = f"fc{b}_post_relu_s"
+        else:
+            block_inst.append(f"  sigmoid_layer u_sigmoid_layer (")
+            block_inst.append(f"    .clk_i   (clk_i),")
+            block_inst.append(f"    .rst_n_i   (rst_n_i),")
+            block_inst.append(f"    .valid_i (sigmoid_valid_i_s),")
+            block_inst.append(f"    .data_i  (fc{b}_pre_act_s),")
+            block_inst.append(f"    .data_o  (sigmoid_data_s),")
+            block_inst.append(f"    .valid_o (sigmoid_valid_o_s)")
+            block_inst.append(f"  );")
+        block_inst.append("")
+
+    sig_lines.append("  logic fifo_empty_s;")
+    sig_lines.append("  logic fifo_empty_q;")
+    sig_lines.append("  logic fifo_full_s;")
+    sig_lines.append("  logic fifo_write_en_s;")
+    sig_lines.append("  logic fifo_read_en_s;")
+    sig_lines.append("  logic fifo_read_en_q;")
+    sig_lines.append("  logic [DATA_WIDTH-1:0] fifo_read_data_s;")
+    sig_lines.append("  logic [DATA_WIDTH-1:0] fifo_write_data_s;")
+    sig_lines.append(f"  logic [$clog2({last_rom} + 1) - 1:0] out_count_q;")
+    sig_lines.append("  logic tvalid_q;")
+
+    body = f'''`begin_keywords "1800-2012"
+module binaryclass_NN 
+  import quant_pkg::*;
+#(
+{param_str}
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  q_data_t s_axis_tdata_i,
+  input  logic    s_axis_tvalid_i,
+  input  logic    s_axis_tlast_i,
+
+  output logic [DATA_WIDTH-1:0]       m_axis_prediction_tdata_o,
+  output logic [KEEP_WIDTH-1:0]       m_axis_prediction_tkeep_o,
+  output logic                        m_axis_prediction_tvalid_o,
+  input  logic                        m_axis_prediction_tready_i,
+  output logic                        m_axis_prediction_tlast_o
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+{"".join(s + chr(10) for s in sig_lines)}
+
+{"".join(s + chr(10) for s in block_inst)}
+
+  sync_fifo #(
+    .DATA_WIDTH(DATA_WIDTH),
+    .DEPTH     (FIFO_DEPTH)     
+) u_fifo_sigmoid (
+    .clk_i        (clk_i),
+    .rst_n_i        (rst_n_i),
+    .write_en_i   (fifo_write_en_s),
+    .write_data_i (fifo_write_data_s),
+    .full_o       (fifo_full_s),
+    .read_en_i   (fifo_read_en_s),
+    .read_data_o (fifo_read_data_s),
+    .empty_o     (fifo_empty_s)
+);
+
+always_ff @(posedge clk_i or negedge rst_n_i) begin : fifo_read_pipe
+  if (!rst_n_i)
+    fifo_read_en_q <= 1'b0;
+  else
+    fifo_read_en_q <= fifo_read_en_s;
+end : fifo_read_pipe
+
+always_ff @(posedge clk_i or negedge rst_n_i) begin : axi_output_logic
+  if (!rst_n_i) begin
+    m_axis_prediction_tdata_o <= 32'h0;
+    tvalid_q                <= 1'b0;
+  end
+  else if (fifo_read_en_q) begin
+    m_axis_prediction_tdata_o <= fifo_read_data_s;
+    tvalid_q                <= 1'b1;
+  end
+  else if (m_axis_prediction_tready_i) begin
+    tvalid_q <= 1'b0;
+  end
+end : axi_output_logic
+
+always_ff @(posedge clk_i or negedge rst_n_i) begin : output_tracking
+  if (!rst_n_i) begin
+    out_count_q <= '0;
+  end
+  else if (m_axis_prediction_tvalid_o && m_axis_prediction_tready_i) begin
+    if (out_count_q == ({last_rom} - 1))
+      out_count_q <= '0;
+    else
+      out_count_q <= out_count_q + 1'b1;
+  end
+end : output_tracking
+
+assign fifo_write_en_s   = sigmoid_valid_o_s && !fifo_full_s;
+assign fifo_read_en_s    = !fifo_empty_s && m_axis_prediction_tready_i;
+assign fifo_write_data_s = {{24'h0, sigmoid_data_s}};
+
+assign m_axis_prediction_tvalid_o = tvalid_q;
+assign m_axis_prediction_tkeep_o  = 4'h1;
+assign m_axis_prediction_tlast_o = (m_axis_prediction_tvalid_o && (out_count_q == ({last_rom} - 1)));
+
+endmodule : binaryclass_NN
+`end_keywords
+'''
+    return body
 
 
 def generate_binaryclass_NN_top_from_template(
@@ -3682,21 +3784,14 @@ def generate_binaryclass_NN_top_from_template(
     weight_width: int = 8,
     python_scale: int = 256,
 ) -> Path:
-    """Generate binaryclass_NN.sv from embedded template, substituting parameters from ONNX layers."""
-    content = BINARYCLASS_NN_SV
-
+    """Generate binaryclass_NN.sv dynamically for any number of layers (paired into blocks)."""
     params = _compute_binaryclass_nn_params(linear_layers, weight_width, python_scale)
-    for param_name, value in params.items():
-        content = re.sub(
-            rf"(parameter int {re.escape(param_name)}\s*=\s*)32'd\d+",
-            rf"\g<1>32'd{value}",
-            content,
-        )
-
+    num_blocks = (len(linear_layers) + 1) // 2
+    content = _build_binaryclass_nn_sv_content(params, num_blocks)
     out_path = out_dir / "binaryclass_NN.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content.rstrip() + "\n", encoding="utf-8")
-    LOGGER.info(f"  Generated binaryclass_NN.sv from template (params from ONNX)")
+    LOGGER.info(f"  Generated binaryclass_NN.sv (params from ONNX, {num_blocks} blocks)")
     return out_path
 
 
@@ -3706,33 +3801,75 @@ def generate_binaryclass_NN_wrapper_from_template(
     weight_width: int = 8,
     python_scale: int = 256,
 ) -> Path:
-    """Generate binaryclass_NN_wrapper.sv from embedded template, substituting parameters."""
-    content = BINARYCLASS_NN_WRAPPER_SV
-
+    """Generate binaryclass_NN_wrapper.sv dynamically for any number of layers."""
     params = _compute_binaryclass_nn_params(linear_layers, weight_width, python_scale)
-    # Map wrapper param names (FC1_NEURONS) to template substitution
-    wrapper_params = {
-        "FC1_NEURONS": params["FC_1_NEURONS"],
-        "FC2_NEURONS": params["FC_2_NEURONS"],
-        "FC3_NEURONS": params["FC_3_NEURONS"],
-        "FC1_INPUT_SIZE": params["FC_1_INPUT_SIZE"],
-        "FC2_INPUT_SIZE": params["FC_2_INPUT_SIZE"],
-        "FC3_INPUT_SIZE": params["FC_3_INPUT_SIZE"],
-        "FC1_ROM_DEPTH": params["FC_1_ROM_DEPTH"],
-        "FC2_ROM_DEPTH": params["FC_2_ROM_DEPTH"],
-        "FC3_ROM_DEPTH": params["FC_3_ROM_DEPTH"],
-    }
-    for param_name, value in wrapper_params.items():
-        content = re.sub(
-            rf"(parameter int {re.escape(param_name)}\s*=\s*)\d+",
-            rf"\g<1>{value}",
-            content,
-        )
+    num_blocks = (len(linear_layers) + 1) // 2
+    param_lines = []
+    for b in range(1, num_blocks + 1):
+        p = f"FC_{b}"
+        param_lines.append(f"    .{p}_NEURONS    (FC{b}_NEURONS),")
+        param_lines.append(f"    .{p}_INPUT_SIZE (FC{b}_INPUT_SIZE),")
+        param_lines.append(f"    .{p}_ROM_DEPTH  (FC{b}_ROM_DEPTH),")
+        param_lines.append(f"    .{p}_IN_LAYER_SCALE   ({params.get(f'{p}_IN_LAYER_SCALE', 8)}),")
+        param_lines.append(f"    .{p}_IN_BIAS_SCALE    ({params.get(f'{p}_IN_BIAS_SCALE', 0)}),")
+        param_lines.append(f"    .{p}_OUT_LAYER_SCALE  ({params.get(f'{p}_OUT_LAYER_SCALE', 8)}),")
+        param_lines.append(f"    .{p}_OUT_BIAS_SCALE   ({params.get(f'{p}_OUT_BIAS_SCALE', 0)})")
+        if b < num_blocks:
+            param_lines[-1] += ","
+    wrapper_params_str = "\n".join(param_lines)
+    wrapper_param_decls = []
+    for b in range(1, num_blocks + 1):
+        wrapper_param_decls.append(f"  parameter int FC{b}_NEURONS    = {params.get(f'FC_{b}_NEURONS', 1)},")
+        wrapper_param_decls.append(f"  parameter int FC{b}_INPUT_SIZE = {params.get(f'FC_{b}_INPUT_SIZE', 1)},")
+        wrapper_param_decls.append(f"  parameter int FC{b}_ROM_DEPTH  = {params.get(f'FC_{b}_ROM_DEPTH', 1)}")
+        if b < num_blocks:
+            wrapper_param_decls[-1] += ","
 
+    body = f'''`begin_keywords "1800-2012"
+module binaryclass_NN_wrapper 
+  import quant_pkg::*;
+#(
+{"".join(wrapper_param_decls)}
+)(
+  input  logic clk_i,
+  input  logic rst_n_i,
+
+  input  q_data_t s_axis_tdata_i,
+  input  logic    s_axis_tvalid_i,
+  input  logic    s_axis_tlast_i,
+
+  output logic [DATA_WIDTH-1:0]       m_axis_prediction_tdata_o,
+  output logic [KEEP_WIDTH-1:0]       m_axis_prediction_tkeep_o,
+  output logic                        m_axis_prediction_tvalid_o,
+  input  logic                        m_axis_prediction_tready_i,
+  output logic                        m_axis_prediction_tlast_o
+);
+
+  timeunit 1ns;
+  timeprecision 1ps;
+
+  binaryclass_NN #(
+{wrapper_params_str}
+  ) u_binaryclass_nn (
+    .clk_i   (clk_i),
+    .rst_n_i   (rst_n_i),
+    .s_axis_tdata_i                  (s_axis_tdata_i),
+    .s_axis_tvalid_i                 (s_axis_tvalid_i),
+    .s_axis_tlast_i                  (s_axis_tlast_i),
+    .m_axis_prediction_tdata_o       (m_axis_prediction_tdata_o),
+    .m_axis_prediction_tkeep_o       (m_axis_prediction_tkeep_o),
+    .m_axis_prediction_tvalid_o      (m_axis_prediction_tvalid_o),
+    .m_axis_prediction_tready_i      (m_axis_prediction_tready_i),
+    .m_axis_prediction_tlast_o       (m_axis_prediction_tlast_o)
+  );
+
+endmodule : binaryclass_NN_wrapper
+`end_keywords
+'''
     out_path = out_dir / "binaryclass_NN_wrapper.sv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(content.rstrip() + "\n", encoding="utf-8")
-    LOGGER.info(f"  Generated binaryclass_NN_wrapper.sv from template")
+    out_path.write_text(body.rstrip() + "\n", encoding="utf-8")
+    LOGGER.info(f"  Generated binaryclass_NN_wrapper.sv")
     return out_path
 
 
@@ -3743,45 +3880,17 @@ def emit_binaryclass_nn_format(
     weight_width: int,
     scale: int,
 ) -> None:
-    """Emit RTL in binaryclass_nn format: binaryclass_NN module, AXI4-Stream ports, reference structure.
-    Requires 3 FC layers (fc1, fc2, fc3) or 6 FC layers (fc1..fc6) paired into 3 blocks."""
+    """Emit RTL in binaryclass_nn format: binaryclass_NN module, AXI4-Stream ports.
+    Supports any number of FC layers; pairs consecutively into ceil(N/2) blocks."""
     linear_layers = [l for l in layers if l.layer_type == "linear"]
-    if len(linear_layers) not in (3, 6):
-        raise RuntimeError(
-            f"binaryclass_nn format requires 3 or 6 FC layers; found {len(linear_layers)}. "
-            "Use hierarchical or flattened format for other topologies."
-        )
-    expected_names = [f"fc{i + 1}" for i in range(len(linear_layers))]
-    for i, fc in enumerate(linear_layers):
-        if fc.name != expected_names[i]:
-            raise RuntimeError(
-                f"binaryclass_nn format expects {expected_names}; got {fc.name} at index {i}"
-            )
+    if not linear_layers:
+        raise RuntimeError("binaryclass_nn format requires at least 1 FC layer.")
 
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    # binaryclass_nn layout: .mem in out_dir root (alongside .sv)
     mem_dir = out_dir
 
-    # Layer dimensions (3 or 6 layers → 3 blocks)
-    if len(linear_layers) == 6:
-        fc1, fc2, fc3 = linear_layers[0], linear_layers[2], linear_layers[4]
-        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-        fc2_in, fc2_out = fc3.in_features or 0, fc3.out_features or 0
-        fc3_in, fc3_out = linear_layers[4].in_features or 0, linear_layers[4].out_features or 0
-        fc1_rom_depth = linear_layers[1].out_features or 0
-        fc2_rom_depth = linear_layers[3].out_features or 0
-        fc3_rom_depth = linear_layers[5].out_features or 1
-    else:
-        fc1, fc2, fc3 = linear_layers[0], linear_layers[1], linear_layers[2]
-        fc1_in, fc1_out = fc1.in_features or 0, fc1.out_features or 0
-        fc2_in, fc2_out = fc2.in_features or 0, fc2.out_features or 0
-        fc3_in, fc3_out = fc3.in_features or 0, fc3.out_features or 0
-        fc1_rom_depth = fc2_out
-        fc2_rom_depth = fc3_out
-        fc3_rom_depth = 1
-
-    # 1. Write reusable templates from binaryclass_nn/ (headers stripped) or embedded fallback
+    # 1. Write reusable templates
     (out_dir / "quant_pkg.sv").write_text(_get_quant_pkg_from_template(weight_width), encoding="utf-8")
     _write_template_or_embedded(out_dir, "mac.sv", _load_reusable_template("mac.sv"), BINARYCLASS_MAC_SV)
     _write_template_or_embedded(out_dir, "fc_in.sv", _load_reusable_template("fc_in.sv"), BINARYCLASS_FC_IN_SV)
@@ -3791,42 +3900,36 @@ def emit_binaryclass_nn_format(
     _write_template_or_embedded(out_dir, "sync_fifo.sv", _load_reusable_template("sync_fifo.sv"), BINARYCLASS_SYNC_FIFO_SV)
     LOGGER.info("  Wrote reusable templates from binaryclass_nn (quant_pkg, mac, fc_in, fc_out, relu_layer, sigmoid_layer, sync_fifo)")
 
-    # 2. Generate .mem files with binaryclass_nn naming (proj_in + proj_out per layer block)
-    # 3 layers: fc_proj_in=fc1, fc_proj_out=fc2; fc_2_proj_in=fc2, fc_2_proj_out=fc3; fc_3_proj_in=fc3, fc_3_proj_out=1x1
-    # 6 layers: fc_proj_in=fc1, fc_proj_out=fc2; fc_2_proj_in=fc3, fc_2_proj_out=fc4; fc_3_proj_in=fc5, fc_3_proj_out=fc6
-    generate_proj_mem_files(
-        layers, mem_dir, scale, weight_width,
-        six_layer_blocks=(len(linear_layers) == 6),
-    )
+    # 2. Generate .mem files (paired: block b = (fc_{2b-1}, fc_{2b}); odd N: last block has (fcN, 1x1))
+    generate_proj_mem_files(layers, mem_dir, scale, weight_width)
 
-    # 3. Generate ROMs with binaryclass_nn naming (3 blocks: fc_proj, fc_2_proj, fc_3_proj)
-    # proj_in: (in_f, out_f); proj_out: (rom_d, proj_out_f) where proj_out_f = next block's output size
-    proj1_out_f = linear_layers[1].out_features or 0
-    proj2_out_f = (linear_layers[3].out_features if len(linear_layers) > 3 else linear_layers[2].out_features) or 1
-    for proj_name, in_f, out_f, rom_d, proj_out_f in [
-        ("fc_proj", fc1_in, fc1_out, fc1_rom_depth, proj1_out_f),
-        ("fc_2_proj", fc2_in, fc2_out, fc2_rom_depth, proj2_out_f),
-        ("fc_3_proj", fc3_in, fc3_out, fc3_rom_depth, 1),
-    ]:
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_in_weights_rom", in_f, out_f, weight_width, mem_dir, "weights")
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_in_bias_rom", 1, out_f, weight_width, mem_dir, "biases")
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_out_weights_rom", rom_d, proj_out_f, weight_width, mem_dir, "weights")
-        _generate_binaryclass_nn_rom(out_dir, f"{proj_name}_out_bias_rom", rom_d, 1, weight_width, mem_dir, "biases")
-
-    # 4. Generate fc_in_layer and fc_out_layer (with generate blocks for our sizes)
-    # Use FC_*_INPUT_SIZE from params (same as binaryclass_NN top) so ROM selection matches
+    # 3. Generate ROMs for each block
+    n = len(linear_layers)
+    num_blocks = (n + 1) // 2
     params = _compute_binaryclass_nn_params(linear_layers, weight_width, scale)
-    _generate_fc_in_layer_binaryclass(
-        out_dir,
-        params["FC_1_INPUT_SIZE"],
-        params["FC_2_INPUT_SIZE"],
-        params["FC_3_INPUT_SIZE"],
-        weight_width,
-        mem_dir,
-    )
-    _generate_fc_out_layer_binaryclass(out_dir, fc1_rom_depth, fc2_rom_depth, fc3_rom_depth, weight_width, mem_dir)
+    input_sizes = [params[f"FC_{b}_INPUT_SIZE"] for b in range(1, num_blocks + 1)]
+    rom_depths = [params[f"FC_{b}_ROM_DEPTH"] for b in range(1, num_blocks + 1)]
 
-    # 5. Generate binaryclass_NN from template (line-by-line match) and wrapper from template
+    for b in range(num_blocks):
+        in_idx = 2 * b
+        out_idx = 2 * b + 1 if 2 * b + 1 < n else None
+        in_layer = linear_layers[in_idx]
+        out_layer = linear_layers[out_idx] if out_idx is not None else None
+        in_f = in_layer.in_features or 0
+        in_out = in_layer.out_features or 0
+        rom_d = (out_layer.out_features or 1) if out_layer else 1
+        proj_out_f = (out_layer.out_features or 1) if out_layer else 1
+        prefix = _proj_prefix(b)
+        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_in_weights_rom", in_f, in_out, weight_width, mem_dir, "weights")
+        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_in_bias_rom", 1, in_out, weight_width, mem_dir, "biases")
+        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_out_weights_rom", rom_d, proj_out_f, weight_width, mem_dir, "weights")
+        _generate_binaryclass_nn_rom(out_dir, f"{prefix}_out_bias_rom", rom_d, 1, weight_width, mem_dir, "biases")
+
+    # 4. Generate fc_in_layer and fc_out_layer (generate blocks for each block's INPUT_SIZE / ROM_DEPTH)
+    _generate_fc_in_layer_binaryclass(out_dir, input_sizes, weight_width, mem_dir)
+    _generate_fc_out_layer_binaryclass(out_dir, rom_depths, weight_width, mem_dir)
+
+    # 5. Generate binaryclass_NN and wrapper
     generate_binaryclass_NN_top_from_template(out_dir, linear_layers, weight_width, scale)
     generate_binaryclass_NN_wrapper_from_template(out_dir, linear_layers, weight_width, scale)
 
@@ -3883,8 +3986,19 @@ endmodule : {rom_name}
     (out_dir / f"{rom_name}.sv").write_text(_pyramidtech_wrap(body, f"{rom_name}.sv", f"ROM for {rom_name}"), encoding="utf-8")
 
 
-def _generate_fc_in_layer_binaryclass(out_dir: Path, l1_in: int, l2_in: int, l3_in: int, weight_width: int, mem_dir: Path) -> None:
-    """Generate fc_in_layer with generate blocks for model sizes. Uses l1_in, l2_in, l3_in for distinct ROM selection (fixes duplicate INPUT_SIZE==5 bug)."""
+def _generate_fc_in_layer_binaryclass(out_dir: Path, input_sizes: List[int], weight_width: int, mem_dir: Path) -> None:
+    """Generate fc_in_layer with generate blocks for each block's INPUT_SIZE (ROM selection)."""
+    branches = []
+    for b, in_sz in enumerate(input_sizes):
+        prefix = _proj_prefix(b)
+        cond = "if" if b == 0 else "else if"
+        branches.append(f"""        {cond} (INPUT_SIZE == {in_sz}) begin
+            {prefix}_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
+                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
+            {prefix}_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
+                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
+        end""")
+    gen_block = "\n".join(branches)
     body = f"""`timescale 1ns/1ps
 import quant_pkg::*;
 
@@ -3930,22 +4044,7 @@ module fc_in_layer #(
 
     genvar n;
     generate
-        if (INPUT_SIZE == {l1_in}) begin
-            fc_proj_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
-            fc_proj_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
-        end else if (INPUT_SIZE == {l2_in}) begin
-            fc_2_proj_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
-            fc_2_proj_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
-        end else if (INPUT_SIZE == {l3_in}) begin
-            fc_3_proj_in_weights_rom #(.DEPTH(INPUT_SIZE), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(weight_addr), .data_o(weight_rom_row));
-            fc_3_proj_in_bias_rom #(.DEPTH(1), .WIDTH(NUM_NEURONS*Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_row));
-        end
+{gen_block}
     endgenerate
 
     generate
@@ -3976,8 +4075,21 @@ endmodule
     (out_dir / "fc_in_layer.sv").write_text(_pyramidtech_wrap(body, "fc_in_layer.sv", "FC input layer with ROM"), encoding="utf-8")
 
 
-def _generate_fc_out_layer_binaryclass(out_dir: Path, rom1: int, rom2: int, rom3: int, weight_width: int, mem_dir: Path) -> None:
-    """Generate fc_out_layer with generate blocks for ROM depths."""
+def _generate_fc_out_layer_binaryclass(out_dir: Path, rom_depths: List[int], weight_width: int, mem_dir: Path) -> None:
+    """Generate fc_out_layer with generate blocks for each block's ROM_DEPTH."""
+    branches = []
+    for b, rom_d in enumerate(rom_depths):
+        prefix = _proj_prefix(b)
+        cond = "if" if b == 0 else "else if"
+        addr_arg = "1'b0" if rom_d <= 1 else "weights_rom_addr"
+        bias_addr = "1'b0" if rom_d <= 1 else "bias_rom_addr"
+        branches.append(f"""        {cond} (ROM_DEPTH == {rom_d}) begin
+            {prefix}_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
+                .clk_i(clk_i), .addr_i({addr_arg}), .data_o(weights_rom_data_raw));
+            {prefix}_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
+                .clk_i(clk_i), .addr_i({bias_addr}), .data_o(bias_rom_data));
+        end""")
+    gen_block = "\n".join(branches)
     body = f"""`timescale 1ns/1ps
 import quant_pkg::*;
 
@@ -4044,22 +4156,7 @@ module fc_out_layer #(
     assign bias_rom_addr    = addr_cnt;
 
     generate
-        if (ROM_DEPTH == {rom1}) begin
-            fc_proj_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(weights_rom_addr), .data_o(weights_rom_data_raw));
-            fc_proj_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(bias_rom_addr), .data_o(bias_rom_data));
-        end else if (ROM_DEPTH == {rom2}) begin
-            fc_2_proj_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(weights_rom_addr), .data_o(weights_rom_data_raw));
-            fc_2_proj_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(bias_rom_addr), .data_o(bias_rom_data));
-        end else if (ROM_DEPTH == {rom3}) begin
-            fc_3_proj_out_weights_rom #(.DEPTH(ROM_DEPTH), .WIDTH(NUM_NEURONS*Q_WIDTH)) weights_rom_inst (
-                .clk_i(clk_i), .addr_i(1'b0), .data_o(weights_rom_data_raw));
-            fc_3_proj_out_bias_rom #(.DEPTH(ROM_DEPTH), .WIDTH(Q_WIDTH*4)) bias_rom_inst (
-                .clk_i(clk_i), .addr_i(1'b0), .data_o(bias_rom_data));
-        end
+{gen_block}
     endgenerate
 
     genvar i;
@@ -4343,11 +4440,13 @@ def generate_rtl_filelist(
     lines = [incdir]
     if binaryclass_nn_format:
         files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "fc_in_layer.sv", "fc_out_layer.sv", "relu_layer.sv", "sigmoid_layer.sv", "sync_fifo.sv"]
-        files.extend(["fc_proj_in_weights_rom.sv", "fc_proj_in_bias_rom.sv", "fc_proj_out_weights_rom.sv", "fc_proj_out_bias_rom.sv"])
-        files.extend(["fc_2_proj_in_weights_rom.sv", "fc_2_proj_in_bias_rom.sv", "fc_2_proj_out_weights_rom.sv", "fc_2_proj_out_bias_rom.sv"])
-        files.extend(["fc_3_proj_in_weights_rom.sv", "fc_3_proj_in_bias_rom.sv", "fc_3_proj_out_weights_rom.sv", "fc_3_proj_out_bias_rom.sv"])
+        num_blocks = (len(linear_layers) + 1) // 2
+        for b in range(num_blocks):
+            prefix = _proj_prefix(b)
+            files.extend([f"{prefix}_in_weights_rom.sv", f"{prefix}_in_bias_rom.sv", f"{prefix}_out_weights_rom.sv", f"{prefix}_out_bias_rom.sv"])
         files.append("binaryclass_NN.sv")
-        top_file = "binaryclass_NN.sv"
+        files.append("binaryclass_NN_wrapper.sv")
+        top_file = "binaryclass_NN_wrapper.sv"
     elif parameterized_layers:
         files = ["quant_pkg.sv", "mac.sv", "fc_in.sv", "fc_out.sv", "relu_layer.sv", "relu_layer_array.sv", "sigmoid_layer.sv", "sync_fifo.sv", "fc_in_layer.sv", "fc_out_layer.sv"]
         for idx in range(len(linear_layers)):
